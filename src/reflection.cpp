@@ -16,6 +16,8 @@
 
 #include "flatbuffers/reflection.h"
 
+#include <unordered_set>
+
 #include "flatbuffers/util.h"
 
 // Helper functionality for reflection.
@@ -781,6 +783,650 @@ Offset<const Table*> CopyTable(FlatBufferBuilder& fbb,
   } else {
     return fbb.EndTable(start);
   }
+}
+
+// ------------------------- REPORT VERIFIER -------------------------
+
+namespace {
+
+// State carried through a report-based verification.
+struct ReportVerifyState {
+  Verifier verifier;
+  const reflection::Schema& schema;
+  const uint8_t* buf;
+  VerifyOptions options;
+  std::vector<VerifyPathStep> path;
+  std::unordered_set<const Table*> seen;
+  size_t work = 0;
+  size_t depth = 0;
+  size_t num_tables = 0;
+  VerifyFailure failure;
+  bool failed = false;
+
+  ReportVerifyState(const reflection::Schema& s, const uint8_t* buf_,
+                    size_t length, const VerifyOptions& opts)
+      : verifier(buf_, length, opts.max_depth, opts.max_tables),
+        schema(s),
+        buf(buf_),
+        options(opts) {}
+
+  bool BudgetExhausted() const {
+    return options.max_work != 0 && work > options.max_work;
+  }
+
+  // Counts one unit of work (a table, vector element or field). Returns
+  // false and records kWorkBudgetExceeded once the budget is spent.
+  bool AddWork(size_t units) {
+    work += units;
+    if (BudgetExhausted()) {
+      Fail(VerifyError::kWorkBudgetExceeded,
+           "verification work budget exceeded");
+      return false;
+    }
+    return true;
+  }
+
+  // Records the first failure. The path is copied from the incrementally
+  // maintained stack, whose depth is bounded by max_depth, so this never
+  // requires walking the buffer again.
+  void Fail(VerifyError err, const char* msg, size_t offset = 0) {
+    if (failed) return;
+    failed = true;
+    failure.error = err;
+    failure.message = msg;
+    failure.byte_offset = offset;
+    failure.work_budget_exceeded = (err == VerifyError::kWorkBudgetExceeded);
+    failure.path = path;
+  }
+};
+
+static size_t ReportOffsetOf(const ReportVerifyState& st, const uint8_t* p) {
+  return static_cast<size_t>(p - st.buf);
+}
+
+static size_t ReportTableOffset(const ReportVerifyState& st,
+                                const Table& table) {
+  return ReportOffsetOf(st, reinterpret_cast<const uint8_t*>(&table));
+}
+
+// Reads a uoffset_t stored at `loc` (an absolute buffer offset), validates
+// that it is non-null and points inside the buffer, and stores the absolute
+// target offset in `*target`.
+static bool ReportReadOffset(ReportVerifyState& st, size_t loc,
+                             size_t* target) {
+  if (!st.verifier.Verify<uoffset_t>(loc)) {
+    st.Fail(VerifyError::kOutOfBounds, "offset field is out of bounds", loc);
+    return false;
+  }
+  auto o = ReadScalar<uoffset_t>(st.buf + loc);
+  if (o == 0) {
+    st.Fail(VerifyError::kInvalidOffset, "offset is null", loc);
+    return false;
+  }
+  *target = loc + o;
+  if (!st.verifier.Verify(*target, 1)) {
+    st.Fail(VerifyError::kInvalidOffset, "offset points outside buffer", loc);
+    return false;
+  }
+  return true;
+}
+
+static bool ReportVerifyString(ReportVerifyState& st, size_t str_loc);
+static bool ReportVerifyObject(ReportVerifyState& st,
+                               const reflection::Object& obj,
+                               const Table* table, bool required);
+static bool ReportVerifyVector(ReportVerifyState& st,
+                               const reflection::Field& field_def,
+                               const Table& table, size_t vec_loc);
+
+// Verifies the value of a union, given the discriminator `utype` (0 means
+// NONE) and a pointer to the value data. Mirrors VerifyUnion above but with
+// structured failure reporting.
+static bool ReportVerifyUnionValue(ReportVerifyState& st,
+                                   const reflection::Field& union_field,
+                                   uint8_t utype, const uint8_t* elem) {
+  if (utype == 0) return true;  // Not present.
+  auto fb_enum = st.schema.enums()->Get(union_field.type()->index());
+  if (utype >= fb_enum->values()->size()) {
+    st.Fail(VerifyError::kInvalidUnionType,
+             "union discriminator is out of range");
+    return false;
+  }
+  auto elem_type = fb_enum->values()->Get(utype)->union_type();
+  if (!elem_type) {
+    st.Fail(VerifyError::kInvalidUnionType,
+             "union discriminator has no object type");
+    return false;
+  }
+  auto elem_loc = ReportOffsetOf(st, elem);
+  switch (elem_type->base_type()) {
+    case reflection::Obj: {
+      auto elem_obj = st.schema.objects()->Get(elem_type->index());
+      if (elem_obj->is_struct()) {
+        if (!st.verifier.Verify(elem_loc, elem_obj->bytesize())) {
+          st.Fail(VerifyError::kOutOfBounds, "union struct value is out of bounds",
+                  elem_loc);
+          return false;
+        }
+        return true;
+      } else {
+        return ReportVerifyObject(st, *elem_obj,
+                                  reinterpret_cast<const Table*>(elem),
+                                  /*required=*/true);
+      }
+    }
+    case reflection::String:
+      return ReportVerifyString(st, elem_loc);
+    default:
+      st.Fail(VerifyError::kInvalidUnionType,
+               "union object type is not a table or string");
+      return false;
+  }
+}
+
+static bool ReportVerifyString(ReportVerifyState& st, size_t str_loc) {
+  // str_loc points at the string's length prefix.
+  if (!st.verifier.Verify<uoffset_t>(str_loc)) {
+    st.Fail(VerifyError::kOutOfBounds, "string length is out of bounds",
+            str_loc);
+    return false;
+  }
+  auto len = ReadScalar<uoffset_t>(st.buf + str_loc);
+  if (len >= FLATBUFFERS_MAX_BUFFER_SIZE) {
+    st.Fail(VerifyError::kOutOfBounds, "string length is too large", str_loc);
+    return false;
+  }
+  auto byte_size = sizeof(uoffset_t) + len;
+  if (!st.verifier.Verify(str_loc, byte_size)) {
+    st.Fail(VerifyError::kOutOfBounds, "string does not fit inside buffer",
+            str_loc);
+    return false;
+  }
+  auto end = str_loc + byte_size;
+  if (!st.verifier.Verify(end, 1)) {
+    st.Fail(VerifyError::kOutOfBounds, "string terminator is out of bounds",
+            end);
+    return false;
+  }
+  if (st.buf[end] != '\0') {
+    st.Fail(VerifyError::kStringNotTerminated, "string is not null-terminated",
+            end);
+    return false;
+  }
+  return true;
+}
+
+template <typename T>
+static bool ReportVerifyScalarField(ReportVerifyState& st,
+                                    const reflection::Field& field_def,
+                                    const Table& table) {
+  auto field_offset = table.GetOptionalFieldOffset(field_def.offset());
+  if (!field_offset) return true;  // Absent: default value is used.
+  auto loc = ReportTableOffset(st, table) + field_offset;
+  if (!st.verifier.VerifyAlignment(loc, sizeof(T))) {
+    st.Fail(VerifyError::kAlignment, "scalar field is misaligned", loc);
+    return false;
+  }
+  if (!st.verifier.Verify(loc, sizeof(T))) {
+    st.Fail(VerifyError::kOutOfBounds, "scalar field is out of bounds", loc);
+    return false;
+  }
+  return true;
+}
+
+static bool ReportVerifyStringField(ReportVerifyState& st,
+                                    const reflection::Field& field_def,
+                                    const Table& table) {
+  auto field_offset = table.GetOptionalFieldOffset(field_def.offset());
+  if (!field_offset) return true;
+  auto loc = ReportTableOffset(st, table) + field_offset;
+  size_t target;
+  if (!ReportReadOffset(st, loc, &target)) return false;
+  return ReportVerifyString(st, target);
+}
+
+static bool ReportVerifyVectorField(ReportVerifyState& st,
+                                    const reflection::Field& field_def,
+                                    const Table& table) {
+  auto field_offset = table.GetOptionalFieldOffset(field_def.offset());
+  if (!field_offset) return true;
+  auto loc = ReportTableOffset(st, table) + field_offset;
+  size_t vec_loc;
+  if (!ReportReadOffset(st, loc, &vec_loc)) return false;
+  return ReportVerifyVector(st, field_def, table, vec_loc);
+}
+
+static bool ReportVerifyObjField(ReportVerifyState& st,
+                                 const reflection::Field& field_def,
+                                 const Table& table) {
+  auto field_offset = table.GetOptionalFieldOffset(field_def.offset());
+  if (!field_offset) {
+    if (field_def.required()) {
+      st.Fail(VerifyError::kMissingRequired, "required table field is missing");
+      return false;
+    }
+    return true;
+  }
+  auto loc = ReportTableOffset(st, table) + field_offset;
+  size_t target;
+  if (!ReportReadOffset(st, loc, &target)) return false;
+  auto child_obj = st.schema.objects()->Get(field_def.type()->index());
+  if (child_obj->is_struct()) {
+    if (!st.verifier.VerifyAlignment(target, child_obj->minalign())) {
+      st.Fail(VerifyError::kAlignment, "struct field is misaligned", target);
+      return false;
+    }
+    if (!st.verifier.Verify(target, child_obj->bytesize())) {
+      st.Fail(VerifyError::kOutOfBounds, "struct field is out of bounds",
+              target);
+      return false;
+    }
+    return true;
+  } else {
+    return ReportVerifyObject(st, *child_obj,
+                              reinterpret_cast<const Table*>(st.buf + target),
+                              field_def.required());
+  }
+}
+
+static bool ReportVerifyUnionField(ReportVerifyState& st,
+                                   const reflection::Field& field_def,
+                                   const Table& table) {
+  // The discriminator lives in the field immediately preceding the value.
+  auto utype_field_offset =
+      table.GetOptionalFieldOffset(field_def.offset() - sizeof(voffset_t));
+  uint8_t utype = 0;
+  if (utype_field_offset) {
+    auto uloc = ReportTableOffset(st, table) + utype_field_offset;
+    if (!st.verifier.Verify(uloc, 1)) {
+      st.Fail(VerifyError::kOutOfBounds, "union discriminator is out of bounds",
+              uloc);
+      return false;
+    }
+    utype = st.buf[uloc];
+  }
+  auto value_field_offset = table.GetOptionalFieldOffset(field_def.offset());
+  if (utype == 0) {
+    // NONE: no value expected (matches the boolean verifier).
+    return true;
+  }
+  if (!value_field_offset) {
+    st.Fail(VerifyError::kUnionValueMissing,
+             "union has a discriminator but no value");
+    return false;
+  }
+  auto vloc = ReportTableOffset(st, table) + value_field_offset;
+  size_t target;
+  if (!ReportReadOffset(st, vloc, &target)) return false;
+  return ReportVerifyUnionValue(st, field_def, utype, st.buf + target);
+}
+
+static bool ReportVerifyField(ReportVerifyState& st,
+                              const reflection::Field& field_def,
+                              const Table& table) {
+  switch (field_def.type()->base_type()) {
+    case reflection::None:
+      return true;
+    case reflection::UType:
+    case reflection::Bool:
+    case reflection::Byte:
+    case reflection::UByte:
+      return ReportVerifyScalarField<uint8_t>(st, field_def, table);
+    case reflection::Short:
+    case reflection::UShort:
+      return ReportVerifyScalarField<uint16_t>(st, field_def, table);
+    case reflection::Int:
+    case reflection::UInt:
+    case reflection::Float:
+      return ReportVerifyScalarField<uint32_t>(st, field_def, table);
+    case reflection::Long:
+    case reflection::ULong:
+    case reflection::Double:
+      return ReportVerifyScalarField<uint64_t>(st, field_def, table);
+    case reflection::String:
+      return ReportVerifyStringField(st, field_def, table);
+    case reflection::Vector:
+      return ReportVerifyVectorField(st, field_def, table);
+    case reflection::Obj:
+      return ReportVerifyObjField(st, field_def, table);
+    case reflection::Union:
+      return ReportVerifyUnionField(st, field_def, table);
+    default:
+      st.Fail(VerifyError::kInvalidVTable, "unknown field type");
+      return false;
+  }
+}
+
+static bool ReportVerifyVector(ReportVerifyState& st,
+                               const reflection::Field& field_def,
+                               const Table& table, size_t vec_loc) {
+  // vec_loc points at the vector's length prefix.
+  if (!st.verifier.Verify<uoffset_t>(vec_loc)) {
+    st.Fail(VerifyError::kOutOfBounds, "vector length is out of bounds",
+            vec_loc);
+    return false;
+  }
+  auto len = ReadScalar<uoffset_t>(st.buf + vec_loc);
+  if (len >= FLATBUFFERS_MAX_BUFFER_SIZE) {
+    st.Fail(VerifyError::kOutOfBounds, "vector length is too large", vec_loc);
+    return false;
+  }
+  auto elem_type = field_def.type()->element();
+  size_t elem_size = 0;
+  const reflection::Object* elem_obj = nullptr;
+  switch (elem_type) {
+    case reflection::UType:
+    case reflection::Bool:
+    case reflection::Byte:
+    case reflection::UByte:
+      elem_size = 1;
+      break;
+    case reflection::Short:
+    case reflection::UShort:
+      elem_size = 2;
+      break;
+    case reflection::Int:
+    case reflection::UInt:
+    case reflection::Float:
+      elem_size = 4;
+      break;
+    case reflection::Long:
+    case reflection::ULong:
+    case reflection::Double:
+      elem_size = 8;
+      break;
+    case reflection::String:
+    case reflection::Obj:
+    case reflection::Union:
+      elem_size = sizeof(uoffset_t);
+      break;
+    default:
+      st.Fail(VerifyError::kInvalidVTable, "unknown vector element type");
+      return false;
+  }
+  if (elem_type == reflection::Obj) {
+    elem_obj = st.schema.objects()->Get(field_def.type()->index());
+    if (elem_obj->is_struct()) elem_size = elem_obj->bytesize();
+  }
+  auto byte_size = sizeof(uoffset_t) + elem_size * len;
+  if (!st.verifier.Verify(vec_loc, byte_size)) {
+    st.Fail(VerifyError::kOutOfBounds, "vector does not fit inside buffer",
+            vec_loc);
+    return false;
+  }
+  auto vec_data = vec_loc + sizeof(uoffset_t);
+  switch (elem_type) {
+    case reflection::String: {
+      for (uoffset_t j = 0; j < len; j++) {
+        if (!st.AddWork(1)) return false;
+        st.path.push_back({"", static_cast<int64_t>(j)});
+        auto elem_loc = vec_data + j * sizeof(uoffset_t);
+        size_t target;
+        if (!ReportReadOffset(st, elem_loc, &target)) {
+          st.path.pop_back();
+          return false;
+        }
+        if (!ReportVerifyString(st, target)) {
+          st.path.pop_back();
+          return false;
+        }
+        st.path.pop_back();
+      }
+      return true;
+    }
+    case reflection::Obj: {
+      if (elem_obj->is_struct()) return true;  // Inline; range checked above.
+      for (uoffset_t j = 0; j < len; j++) {
+        if (!st.AddWork(1)) return false;
+        st.path.push_back({"", static_cast<int64_t>(j)});
+        auto elem_loc = vec_data + j * sizeof(uoffset_t);
+        size_t target;
+        if (!ReportReadOffset(st, elem_loc, &target)) {
+          st.path.pop_back();
+          return false;
+        }
+        if (!ReportVerifyObject(st, *elem_obj,
+                                reinterpret_cast<const Table*>(st.buf + target),
+                                /*required=*/true)) {
+          st.path.pop_back();
+          return false;
+        }
+        st.path.pop_back();
+      }
+      return true;
+    }
+    case reflection::Union: {
+      // The type vector is stored in the field immediately preceding the
+      // value vector field.
+      auto type_field_offset =
+          table.GetOptionalFieldOffset(field_def.offset() - sizeof(voffset_t));
+      if (!type_field_offset) {
+        st.Fail(VerifyError::kInvalidUnionType, "union type vector is missing");
+        return false;
+      }
+      auto type_loc = ReportTableOffset(st, table) + type_field_offset;
+      size_t type_vec_loc;
+      if (!ReportReadOffset(st, type_loc, &type_vec_loc)) return false;
+      if (!st.verifier.Verify<uoffset_t>(type_vec_loc)) {
+        st.Fail(VerifyError::kOutOfBounds,
+                 "union type vector length is out of bounds", type_vec_loc);
+        return false;
+      }
+      auto type_len = ReadScalar<uoffset_t>(st.buf + type_vec_loc);
+      if (type_len >= FLATBUFFERS_MAX_BUFFER_SIZE) {
+        st.Fail(VerifyError::kOutOfBounds,
+                 "union type vector length is too large", type_vec_loc);
+        return false;
+      }
+      auto type_byte_size = sizeof(uoffset_t) + type_len;
+      if (!st.verifier.Verify(type_vec_loc, type_byte_size)) {
+        st.Fail(VerifyError::kOutOfBounds,
+                 "union type vector does not fit inside buffer", type_vec_loc);
+        return false;
+      }
+      if (type_len != len) {
+        st.Fail(VerifyError::kInvalidUnionType,
+                 "union type vector length does not match value vector length",
+                 type_vec_loc);
+        return false;
+      }
+      for (uoffset_t j = 0; j < len; j++) {
+        if (!st.AddWork(1)) return false;
+        st.path.push_back({"", static_cast<int64_t>(j)});
+        auto type_elem_loc = type_vec_loc + sizeof(uoffset_t) + j;
+        auto utype = st.buf[type_elem_loc];  // range checked above
+        auto elem_loc = vec_data + j * sizeof(uoffset_t);
+        size_t target;
+        if (!ReportReadOffset(st, elem_loc, &target)) {
+          st.path.pop_back();
+          return false;
+        }
+        if (!ReportVerifyUnionValue(st, field_def, utype, st.buf + target)) {
+          st.path.pop_back();
+          return false;
+        }
+        st.path.pop_back();
+      }
+      return true;
+    }
+    default:
+      // Scalar elements are fully covered by the byte-range check above.
+      return true;
+  }
+}
+
+static bool ReportVerifyObject(ReportVerifyState& st,
+                               const reflection::Object& obj,
+                               const Table* table, bool required) {
+  if (!table) {
+    if (required) {
+      st.Fail(VerifyError::kMissingRequired, "required table field is missing");
+    }
+    return false;
+  }
+  if (st.seen.count(table) != 0) return true;  // already verified (DAG/cycle)
+  st.seen.insert(table);
+
+  if (!st.AddWork(1)) return false;  // the table itself
+
+  auto table_off = ReportOffsetOf(st, reinterpret_cast<const uint8_t*>(table));
+
+  // Mirror Verifier::VerifyTableStart with categorization.
+  if (!st.verifier.Verify<soffset_t>(table_off)) {
+    st.Fail(VerifyError::kOutOfBounds, "table vtable offset is out of bounds",
+            table_off);
+    return false;
+  }
+  auto vtable_rel = ReadScalar<soffset_t>(st.buf + table_off);
+  auto vtable_off = table_off - static_cast<size_t>(vtable_rel);
+  if (!st.verifier.Verify<voffset_t>(vtable_off)) {
+    // Report the table location, where the bad vtable offset is stored.
+    st.Fail(VerifyError::kOutOfBounds, "vtable is out of bounds", table_off);
+    return false;
+  }
+  if (!st.verifier.VerifyAlignment(
+          ReadScalar<voffset_t>(st.buf + vtable_off), sizeof(voffset_t))) {
+    st.Fail(VerifyError::kAlignment, "vtable is misaligned", vtable_off);
+    return false;
+  }
+  auto vsize = ReadScalar<voffset_t>(st.buf + vtable_off);
+  if ((vsize & 1) != 0) {
+    st.Fail(VerifyError::kInvalidVTable, "vtable size is odd", vtable_off);
+    return false;
+  }
+  if (!st.verifier.Verify(vtable_off, vsize)) {
+    st.Fail(VerifyError::kOutOfBounds, "vtable does not fit inside buffer",
+            vtable_off);
+    return false;
+  }
+
+  st.depth++;
+  st.num_tables++;
+  if (st.depth > st.options.max_depth) {
+    st.Fail(VerifyError::kMaxDepthExceeded, "maximum nesting depth exceeded",
+            table_off);
+    return false;
+  }
+  if (st.num_tables > st.options.max_tables) {
+    st.Fail(VerifyError::kMaxTablesExceeded,
+             "maximum number of tables exceeded", table_off);
+    return false;
+  }
+  st.verifier.VerifyComplexity();  // keep verifier state in lockstep
+
+  for (uoffset_t i = 0; i < obj.fields()->size(); i++) {
+    auto field_def = obj.fields()->Get(i);
+    if (!st.AddWork(1)) return false;
+    st.path.push_back({field_def->name()->str(), -1});
+    auto ok = ReportVerifyField(st, *field_def, *table);
+    st.path.pop_back();
+    if (!ok) return false;
+  }
+
+  st.verifier.EndTable();
+  st.depth--;
+  return true;
+}
+
+static VerifyResult ReportVerifyBuffer(const reflection::Schema& schema,
+                                       const reflection::Object& root,
+                                       const uint8_t* buf, size_t length,
+                                       const VerifyOptions& options,
+                                       bool size_prefixed) {
+  VerifyResult result;
+  if (length < FLATBUFFERS_MIN_BUFFER_SIZE) {
+    result.failure.error = VerifyError::kBufferTooSmall;
+    result.failure.message =
+        "buffer is smaller than the minimum FlatBuffer size";
+    result.failure.byte_offset = 0;
+    return result;
+  }
+  ReportVerifyState st(schema, buf, length, options);
+  size_t root_loc = size_prefixed ? sizeof(uoffset_t) : 0;
+  if (size_prefixed) {
+    if (!st.verifier.Verify<uoffset_t>(0)) {
+      st.Fail(VerifyError::kOutOfBounds, "size prefix is out of bounds", 0);
+      result.failure = st.failure;
+      return result;
+    }
+    auto prefix = ReadScalar<uoffset_t>(buf);
+    if (prefix + sizeof(uoffset_t) > length) {
+      st.Fail(VerifyError::kOutOfBounds, "size prefix exceeds buffer length",
+              0);
+      result.failure = st.failure;
+      return result;
+    }
+  }
+  if (!st.verifier.Verify<uoffset_t>(root_loc)) {
+    st.Fail(VerifyError::kOutOfBounds, "root offset is out of bounds",
+            root_loc);
+    result.failure = st.failure;
+    return result;
+  }
+  auto root_off = ReadScalar<uoffset_t>(buf + root_loc);
+  if (root_off == 0) {
+    st.Fail(VerifyError::kInvalidOffset, "root offset is null", root_loc);
+    result.failure = st.failure;
+    return result;
+  }
+  if (!st.verifier.Verify(root_loc + root_off, 1)) {
+    st.Fail(VerifyError::kInvalidOffset, "root offset points outside buffer",
+            root_loc);
+    result.failure = st.failure;
+    return result;
+  }
+  auto ok = ReportVerifyObject(
+      st, root, reinterpret_cast<const Table*>(buf + root_loc + root_off),
+      /*required=*/true);
+  result.ok = ok && !st.failed;
+  if (!result.ok) result.failure = st.failure;
+  return result;
+}
+
+}  // namespace
+
+std::string VerifyFailure::PathString() const {
+  std::string s = "root";
+  for (const auto& step : path) {
+    if (step.vector_index >= 0) {
+      s += "[" + std::to_string(step.vector_index) + "]";
+    } else if (!step.field.empty()) {
+      s += "." + step.field;
+    }
+  }
+  return s;
+}
+
+const char* VerifyFailure::ErrorName() const {
+  switch (error) {
+    case VerifyError::kNone: return "none";
+    case VerifyError::kOutOfBounds: return "out_of_bounds";
+    case VerifyError::kAlignment: return "alignment";
+    case VerifyError::kInvalidVTable: return "invalid_vtable";
+    case VerifyError::kInvalidOffset: return "invalid_offset";
+    case VerifyError::kMissingRequired: return "missing_required";
+    case VerifyError::kInvalidUnionType: return "invalid_union_type";
+    case VerifyError::kUnionValueMissing: return "union_value_missing";
+    case VerifyError::kStringNotTerminated: return "string_not_terminated";
+    case VerifyError::kMaxDepthExceeded: return "max_depth_exceeded";
+    case VerifyError::kMaxTablesExceeded: return "max_tables_exceeded";
+    case VerifyError::kWorkBudgetExceeded: return "work_budget_exceeded";
+    case VerifyError::kBufferTooSmall: return "buffer_too_small";
+  }
+  return "unknown";
+}
+
+VerifyResult VerifyWithReport(const reflection::Schema& schema,
+                              const reflection::Object& root,
+                              const uint8_t* buf, size_t length,
+                              const VerifyOptions& options) {
+  return ReportVerifyBuffer(schema, root, buf, length, options, false);
+}
+
+VerifyResult VerifySizePrefixedWithReport(
+    const reflection::Schema& schema, const reflection::Object& root,
+    const uint8_t* buf, size_t length, const VerifyOptions& options) {
+  return ReportVerifyBuffer(schema, root, buf, length, options, true);
 }
 
 bool Verify(const reflection::Schema& schema, const reflection::Object& root,

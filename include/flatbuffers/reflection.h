@@ -525,6 +525,91 @@ bool VerifySizePrefixed(const reflection::Schema& schema,
                         size_t length, uoffset_t max_depth = 64,
                         uoffset_t max_tables = 1000000);
 
+// ------------------------- FAILURE REPORTING -------------------------
+//
+// The VerifyWithReport family of functions mirrors Verify above, but instead
+// of a single boolean it returns a structured report describing the first
+// failure encountered. The report records the path of table fields and vector
+// indices from the root table down to the failing access, the absolute byte
+// offset of that access inside the buffer, and an error category.
+//
+// All bounds, alignment and depth/table limits are enforced with the same
+// Verifier machinery as Verify: no pointer is read before its range has been
+// checked. Repeated references to the same table (DAGs and cycles) are
+// deduplicated so verification always terminates, and the path recorded is the
+// one on which the failure was actually reached.
+//
+// The amount of work performed (tables, vector elements and fields visited)
+// can be capped with VerifyOptions::max_work. The path is maintained
+// incrementally during verification (pushed on descent, popped on ascent), so
+// producing the report never requires walking the already-verified buffer a
+// second time; the report construction itself is bounded by max_depth.
+
+// Why a reflection-based verification failed.
+enum class VerifyError {
+  kNone = 0,             // Verification succeeded.
+  kOutOfBounds,          // An access extends past the end of the buffer.
+  kAlignment,            // A read was misaligned.
+  kInvalidVTable,        // A table's vtable is outside the buffer or malformed.
+  kInvalidOffset,        // A table/vector/string offset is null or out of bounds.
+  kMissingRequired,      // A required field is absent.
+  kInvalidUnionType,     // A union discriminator is missing or out of range.
+  kUnionValueMissing,    // A union has a discriminator but no value.
+  kStringNotTerminated,  // A string's terminating null byte is missing.
+  kMaxDepthExceeded,     // The nesting-depth limit was hit.
+  kMaxTablesExceeded,    // The table-count limit was hit.
+  kWorkBudgetExceeded,   // The work budget was exhausted before verification finished.
+  kBufferTooSmall,       // The buffer is smaller than the minimum FlatBuffer size.
+};
+
+// One step on the path from the root table to the failing access.
+struct VerifyPathStep {
+  std::string field;     // Field name; empty for vector elements.
+  int64_t vector_index;  // >= 0 when the failure is inside a vector element.
+};
+
+// Detailed description of the first verification failure.
+struct VerifyFailure {
+  VerifyError error = VerifyError::kNone;
+  std::vector<VerifyPathStep> path;
+  size_t byte_offset = 0;  // Absolute offset in the buffer of the failing access.
+  std::string message;
+  bool work_budget_exceeded = false;
+
+  // Renders the path as e.g. "root.enemy.testarrayofstring[1]".
+  std::string PathString() const;
+  // Human-readable name of the error category.
+  const char* ErrorName() const;
+};
+
+// Limits and budget for report-based verification.
+struct VerifyOptions {
+  uoffset_t max_depth = 64;
+  uoffset_t max_tables = 1000000;
+  // Maximum number of verification work units (tables, vector elements and
+  // fields) to perform. 0 means unlimited. When the budget is exceeded,
+  // verification stops and VerifyFailure::work_budget_exceeded is set.
+  size_t max_work = 0;
+};
+
+// The result of report-based verification.
+struct VerifyResult {
+  bool ok = false;
+  VerifyFailure failure;
+};
+
+// Verifies a FlatBuffer described by a reflection schema, returning a
+// structured report of the first failure.
+VerifyResult VerifyWithReport(
+    const reflection::Schema& schema, const reflection::Object& root,
+    const uint8_t* buf, size_t length,
+    const VerifyOptions& options = VerifyOptions());
+
+VerifyResult VerifySizePrefixedWithReport(
+    const reflection::Schema& schema, const reflection::Object& root,
+    const uint8_t* buf, size_t length,
+    const VerifyOptions& options = VerifyOptions());
+
 }  // namespace flatbuffers
 
 #endif  // FLATBUFFERS_REFLECTION_H_
