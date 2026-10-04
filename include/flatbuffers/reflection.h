@@ -525,6 +525,93 @@ bool VerifySizePrefixed(const reflection::Schema& schema,
                         size_t length, uoffset_t max_depth = 64,
                         uoffset_t max_tables = 1000000);
 
+// ------------------------- STRUCTURED VERIFICATION REPORTS -------------------------
+
+// Categories of verification failures reported by VerifyWithReport().
+enum class ReflectionVerifyError : uint8_t {
+  kNone = 0,              // No error (verification passed).
+  kBufferTooSmall,        // Buffer smaller than the minimum flatbuffer size.
+  kOutOfBounds,           // A read would go past the end of the buffer.
+  kMisaligned,            // Data is not aligned to its required alignment.
+  kInvalidOffset,         // An offset is 0, negative, or points out of buffer.
+  kMalformedVTable,       // A vtable is malformed.
+  kMissingRequiredField,  // A required field is absent.
+  kStringNotTerminated,   // A string is missing its NUL terminator.
+  kUnionTypeMismatch,     // Union discriminator and value are inconsistent.
+  kDepthLimitExceeded,    // Nesting deeper than max_depth.
+  kTableLimitExceeded,    // More tables than max_tables.
+  kBudgetExceeded,        // Work budget exhausted before completing.
+};
+
+// Returns a short human-readable name for an error category.
+const char* ReflectionVerifyErrorName(ReflectionVerifyError error);
+
+// Sentinel for ReflectionVerifyFailure::vector_index when the failure did
+// not happen inside a vector.
+constexpr size_t kReflectionVerifyNoVectorIndex = ~static_cast<size_t>(0);
+
+struct ReflectionVerifyOptions {
+  // Same meaning as Verifier::Options::max_depth / max_tables.
+  uoffset_t max_depth = 64;
+  uoffset_t max_tables = 1000000;
+  // If true, verify all data is aligned.
+  bool check_alignment = true;
+  // Optional work budget: the maximum number of verification steps (roughly
+  // one per visited table, field and vector element) before verification
+  // stops early. 0 means unlimited. When the budget is exhausted the report
+  // has budget_exceeded set and category kBudgetExceeded; this is flagged
+  // separately from an actual verification failure of the buffer contents.
+  uint64_t max_work = 0;
+};
+
+struct ReflectionVerifyFailure {
+  // The category of the first failure encountered.
+  ReflectionVerifyError category = ReflectionVerifyError::kNone;
+  // Path of table fields (and vector indices) from the root to the failing
+  // location, e.g. "testarrayoftables[1].name". The number of segments and
+  // the length of each segment are capped, so building this string is
+  // bounded even for deeply nested failures; a truncated path ends in "/...".
+  std::string path;
+  // Offset (in bytes, relative to the start of the buffer) of the failing
+  // location.
+  size_t byte_offset = 0;
+  // The innermost vector index on the failure path, or
+  // kReflectionVerifyNoVectorIndex if the failure is not inside a vector.
+  size_t vector_index = kReflectionVerifyNoVectorIndex;
+};
+
+struct ReflectionVerifyReport {
+  // True if the buffer passed verification.
+  bool ok = true;
+  // True if verification stopped because the work budget was exhausted
+  // (in which case ok is false and failure.category is kBudgetExceeded).
+  bool budget_exceeded = false;
+  // Details of the first failure. Only meaningful when ok is false.
+  ReflectionVerifyFailure failure;
+  // A one-line human-readable summary, e.g. for logging.
+  std::string ToString() const;
+};
+
+// Verifies the provided flatbuffer using reflection, like Verify() above,
+// but additionally reports the first failure with its field path, vector
+// index, byte offset and error category.
+//
+// The same bounds, alignment, depth and table-count limits as the regular
+// Verifier are applied, and no pointer is dereferenced before the memory it
+// refers to has been verified. Union discriminators and their values are
+// checked together. Tables referenced more than once are verified only
+// once, so verification always terminates, and the reported path is the
+// path of the visit that actually detected the failure.
+ReflectionVerifyReport VerifyWithReport(
+    const reflection::Schema& schema, const reflection::Object& root,
+    const uint8_t* buf, size_t length,
+    const ReflectionVerifyOptions& opts = ReflectionVerifyOptions());
+
+ReflectionVerifyReport VerifySizePrefixedWithReport(
+    const reflection::Schema& schema, const reflection::Object& root,
+    const uint8_t* buf, size_t length,
+    const ReflectionVerifyOptions& opts = ReflectionVerifyOptions());
+
 }  // namespace flatbuffers
 
 #endif  // FLATBUFFERS_REFLECTION_H_

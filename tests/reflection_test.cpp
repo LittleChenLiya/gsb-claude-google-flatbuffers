@@ -1,5 +1,6 @@
 #include "reflection_test.h"
 
+#include "flatbuffers/idl.h"
 #include "flatbuffers/minireflect.h"
 #include "flatbuffers/reflection.h"
 #include "flatbuffers/reflection_generated.h"
@@ -409,5 +410,343 @@ void MiniReflectFixedLengthArrayTest() {
 #endif
 }
 
+void ReflectionVerifyReportTest(const std::string& tests_data_path) {
+  // Load the binary schema for the monster type.
+  std::string bfbsfile;
+  TEST_EQ(flatbuffers::LoadFile((tests_data_path + "monster_test.bfbs").c_str(),
+                                true, &bfbsfile),
+          true);
+  auto& schema = *reflection::GetSchema(bfbsfile.c_str());
+  auto& root = *schema.root_table();
+
+  // Build a valid buffer containing nested tables (which share one vtable),
+  // a vector of strings, and a union.
+  flatbuffers::FlatBufferBuilder fbb;
+  auto child1_name = fbb.CreateString("ChildOne");
+  auto child2_name = fbb.CreateString("ChildTwo");
+  auto s0 = fbb.CreateString("alpha");
+  auto s1 = fbb.CreateString("beta");
+  auto name = fbb.CreateString("Reflecto");
+  MonsterBuilder child1(fbb);
+  child1.add_name(child1_name);
+  child1.add_hp(80);
+  auto child1_off = child1.Finish();
+  MonsterBuilder child2(fbb);
+  child2.add_name(child2_name);
+  child2.add_hp(90);
+  auto child2_off = child2.Finish();
+  std::vector<flatbuffers::Offset<Monster>> children;
+  children.push_back(child1_off);
+  children.push_back(child2_off);
+  auto children_vec = fbb.CreateVector(children);
+  std::vector<flatbuffers::Offset<flatbuffers::String>> strings;
+  strings.push_back(s0);
+  strings.push_back(s1);
+  auto strings_vec = fbb.CreateVector(strings);
+  auto union_val = CreateTestSimpleTableWithEnum(fbb, Color_Red);
+  MonsterBuilder monster(fbb);
+  monster.add_name(name);
+  monster.add_hp(100);
+  monster.add_testarrayoftables(children_vec);
+  monster.add_testarrayofstring(strings_vec);
+  monster.add_test_type(Any_TestSimpleTableWithEnum);
+  monster.add_test(union_val.Union());
+  fbb.Finish(monster.Finish());
+  std::vector<uint8_t> valid(fbb.GetBufferPointer(),
+                             fbb.GetBufferPointer() + fbb.GetSize());
+
+  // Locate the absolute buffer offset of a root table field.
+  auto field_loc = [&](std::vector<uint8_t>& buf, const char* field_name,
+                       size_t* loc) {
+    auto table = flatbuffers::GetAnyRoot(buf.data());
+    auto field = root.fields()->LookupByKey(field_name);
+    TEST_NOTNULL(field);
+    auto off = table->GetOptionalFieldOffset(field->offset());
+    TEST_NE(off, 0);
+    *loc = (reinterpret_cast<const uint8_t*>(table) - buf.data()) + off;
+  };
+
+  // The valid buffer passes, agrees with the boolean API, and the two
+  // children really do share a single vtable.
+  {
+    auto report =
+        flatbuffers::VerifyWithReport(schema, root, valid.data(), valid.size());
+    TEST_EQ(report.ok, true);
+    TEST_EQ(report.budget_exceeded, false);
+    TEST_EQ(report.failure.category, flatbuffers::ReflectionVerifyError::kNone);
+    TEST_EQ(flatbuffers::Verify(schema, root, valid.data(), valid.size()),
+            true);
+    auto monster_ptr = MyGame::Example::GetMonster(valid.data());
+    // Compare vtable addresses of the two children (Table is a private
+    // base in generated code, so compute them from the raw bytes).
+    auto vtable_of = [](const void* t) {
+      auto p = reinterpret_cast<const uint8_t*>(t);
+      return p - flatbuffers::ReadScalar<flatbuffers::soffset_t>(p);
+    };
+    TEST_EQ(vtable_of(monster_ptr->testarrayoftables()->Get(0)),
+            vtable_of(monster_ptr->testarrayoftables()->Get(1)));
+  }
+
+  // Corrupt an offset: the report must point at the corresponding field.
+  {
+    auto bad = valid;
+    size_t loc = 0;
+    field_loc(bad, "testarrayofstring", &loc);
+    flatbuffers::WriteScalar(bad.data() + loc,
+                             static_cast<flatbuffers::uoffset_t>(0x7FFFFF00));
+    auto report =
+        flatbuffers::VerifyWithReport(schema, root, bad.data(), bad.size());
+    TEST_EQ(report.ok, false);
+    TEST_EQ(report.budget_exceeded, false);
+    TEST_EQ(report.failure.category,
+            flatbuffers::ReflectionVerifyError::kInvalidOffset);
+    TEST_EQ_STR(report.failure.path.c_str(), "testarrayofstring");
+    TEST_EQ(report.failure.byte_offset, loc);
+    TEST_EQ(report.failure.vector_index,
+            flatbuffers::kReflectionVerifyNoVectorIndex);
+    TEST_EQ(flatbuffers::Verify(schema, root, bad.data(), bad.size()), false);
+    // The summary line mentions the field path and the error location.
+    TEST_ASSERT(report.ToString().find("testarrayofstring") !=
+                std::string::npos);
+    TEST_ASSERT(report.ToString().find("invalid offset") != std::string::npos);
+
+    // The corrupted-offset buffer must also be safely rejected for every
+    // truncation of the input, without reading out of bounds.
+    for (size_t cut = 0; cut <= bad.size(); cut++) {
+      auto trunc_report =
+          flatbuffers::VerifyWithReport(schema, root, bad.data(), cut);
+      TEST_EQ(trunc_report.ok, false);
+    }
+  }
+
+  // Corrupt a string terminator: the report must point at the string field.
+  {
+    auto bad = valid;
+    size_t loc = 0;
+    field_loc(bad, "name", &loc);
+    const size_t str_off =
+        loc + flatbuffers::ReadScalar<flatbuffers::uoffset_t>(bad.data() + loc);
+    const size_t str_len = flatbuffers::ReadScalar<flatbuffers::uoffset_t>(
+        bad.data() + str_off);
+    const size_t term = str_off + sizeof(flatbuffers::uoffset_t) + str_len;
+    TEST_EQ(bad[term], 0);
+    bad[term] = 'X';
+    auto report =
+        flatbuffers::VerifyWithReport(schema, root, bad.data(), bad.size());
+    TEST_EQ(report.ok, false);
+    TEST_EQ(report.failure.category,
+            flatbuffers::ReflectionVerifyError::kStringNotTerminated);
+    TEST_EQ_STR(report.failure.path.c_str(), "name");
+    TEST_EQ(report.failure.byte_offset, term);
+    TEST_EQ(flatbuffers::Verify(schema, root, bad.data(), bad.size()), false);
+  }
+
+  // Corrupt a union discriminator: the report must point at the union field.
+  {
+    auto bad = valid;
+    size_t loc = 0;
+    field_loc(bad, "test_type", &loc);
+    bad[loc] = 200;  // Not a member of the Any union.
+    auto report =
+        flatbuffers::VerifyWithReport(schema, root, bad.data(), bad.size());
+    TEST_EQ(report.ok, false);
+    TEST_EQ(report.failure.category,
+            flatbuffers::ReflectionVerifyError::kUnionTypeMismatch);
+    TEST_EQ_STR(report.failure.path.c_str(), "test");
+
+    // A discriminator of NONE with a value still present is inconsistent.
+    auto bad2 = valid;
+    field_loc(bad2, "test_type", &loc);
+    bad2[loc] = 0;
+    auto report2 =
+        flatbuffers::VerifyWithReport(schema, root, bad2.data(), bad2.size());
+    TEST_EQ(report2.ok, false);
+    TEST_EQ(report2.failure.category,
+            flatbuffers::ReflectionVerifyError::kUnionTypeMismatch);
+  }
+
+  // A zero-length buffer is rejected without being read.
+  {
+    auto report = flatbuffers::VerifyWithReport(schema, root, nullptr, 0);
+    TEST_EQ(report.ok, false);
+    TEST_EQ(report.failure.category,
+            flatbuffers::ReflectionVerifyError::kBufferTooSmall);
+    TEST_EQ(report.failure.byte_offset, 0);
+  }
+
+  // Every truncation of the valid buffer is handled safely. Truncations
+  // that remove referenced data are rejected; truncations that only remove
+  // unreferenced trailing padding may still pass, but then the boolean
+  // verifier must agree.
+  for (size_t cut = 0; cut < valid.size(); cut++) {
+    auto report =
+        flatbuffers::VerifyWithReport(schema, root, valid.data(), cut);
+    if (report.ok) {
+      TEST_EQ(flatbuffers::Verify(schema, root, valid.data(), cut), true);
+    } else {
+      TEST_NE(report.failure.category,
+              flatbuffers::ReflectionVerifyError::kNone);
+    }
+  }
+  // Truncating into the last string's NUL terminator is rejected.
+  {
+    auto report = flatbuffers::VerifyWithReport(schema, root, valid.data(),
+                                                valid.size() - 4);
+    TEST_EQ(report.ok, false);
+    TEST_EQ(report.failure.category,
+            flatbuffers::ReflectionVerifyError::kOutOfBounds);
+  }
+
+  // A work budget that is too small stops verification early and is flagged
+  // separately from a content failure; a generous budget passes.
+  {
+    flatbuffers::ReflectionVerifyOptions opts;
+    opts.max_work = 3;
+    auto report =
+        flatbuffers::VerifyWithReport(schema, root, valid.data(), valid.size(),
+                                      opts);
+    TEST_EQ(report.ok, false);
+    TEST_EQ(report.budget_exceeded, true);
+    TEST_EQ(report.failure.category,
+            flatbuffers::ReflectionVerifyError::kBudgetExceeded);
+    TEST_ASSERT(report.ToString().find("budget") != std::string::npos);
+
+    flatbuffers::ReflectionVerifyOptions generous;
+    generous.max_work = 1000000;
+    TEST_EQ(flatbuffers::VerifyWithReport(schema, root, valid.data(),
+                                          valid.size(), generous)
+                .ok,
+            true);
+  }
+
+  // Size-prefixed buffers are supported too.
+  {
+    flatbuffers::FlatBufferBuilder sized_fbb;
+    auto sized_name = sized_fbb.CreateString("Sized");
+    MonsterBuilder sized(sized_fbb);
+    sized.add_name(sized_name);
+    sized.add_hp(10);
+    sized_fbb.FinishSizePrefixed(sized.Finish());
+    auto report = flatbuffers::VerifySizePrefixedWithReport(
+        schema, root, sized_fbb.GetBufferPointer(), sized_fbb.GetSize());
+    TEST_EQ(report.ok, true);
+    TEST_EQ(report.ok, flatbuffers::VerifySizePrefixed(
+                          schema, root, sized_fbb.GetBufferPointer(),
+                          sized_fbb.GetSize()));
+  }
+
+  // A self-recursive schema for DAG / deep-nesting tests.
+  flatbuffers::Parser parser;
+  TEST_EQ(parser.Parse("table Node { a:Node; b:Node; child:Node; "
+                       "name:string; } root_type Node;"),
+          true);
+  parser.Serialize();
+  auto& node_schema = *reflection::GetSchema(parser.builder_.GetBufferPointer());
+  auto& node_root = *node_schema.root_table();
+
+  // Two fields referencing the same table (a DAG) must terminate and pass.
+  {
+    flatbuffers::FlatBufferBuilder dag_fbb;
+    auto leaf_start = dag_fbb.StartTable();
+    auto leaf = dag_fbb.EndTable(leaf_start);
+    auto root_start = dag_fbb.StartTable();
+    dag_fbb.AddOffset(flatbuffers::FieldIndexToOffset(0),
+                      flatbuffers::Offset<void>(leaf));
+    dag_fbb.AddOffset(flatbuffers::FieldIndexToOffset(1),
+                      flatbuffers::Offset<void>(leaf));
+    dag_fbb.Finish(flatbuffers::Offset<void>(dag_fbb.EndTable(root_start)));
+    auto report = flatbuffers::VerifyWithReport(
+        node_schema, node_root, dag_fbb.GetBufferPointer(), dag_fbb.GetSize());
+    TEST_EQ(report.ok, true);
+  }
+
+  // Deep nesting beyond the depth limit is reported as such.
+  {
+    const int kDeep = 300;
+    flatbuffers::FlatBufferBuilder deep_fbb;
+    flatbuffers::uoffset_t prev = 0;
+    for (int i = 0; i < kDeep; i++) {
+      auto start = deep_fbb.StartTable();
+      if (prev) {
+        deep_fbb.AddOffset(flatbuffers::FieldIndexToOffset(2),
+                           flatbuffers::Offset<void>(prev));
+      }
+      prev = deep_fbb.EndTable(start);
+    }
+    deep_fbb.Finish(flatbuffers::Offset<void>(prev));
+    auto report = flatbuffers::VerifyWithReport(node_schema, node_root,
+                                                deep_fbb.GetBufferPointer(),
+                                                deep_fbb.GetSize());
+    TEST_EQ(report.ok, false);
+    TEST_EQ(report.failure.category,
+            flatbuffers::ReflectionVerifyError::kDepthLimitExceeded);
+    // The reported path is bounded.
+    TEST_ASSERT(report.failure.path.size() < 10000);
+
+    // With a raised depth limit the same buffer verifies fine.
+    flatbuffers::ReflectionVerifyOptions deep_opts;
+    deep_opts.max_depth = 1000;
+    TEST_EQ(flatbuffers::VerifyWithReport(node_schema, node_root,
+                                          deep_fbb.GetBufferPointer(),
+                                          deep_fbb.GetSize(), deep_opts)
+                .ok,
+            true);
+  }
+
+  // A failure at the end of a very deep chain: the report path must stay
+  // bounded (report construction itself obeys a work budget).
+  {
+    const int kVeryDeep = 5000;
+    flatbuffers::FlatBufferBuilder chain_fbb;
+    auto deep_name = chain_fbb.CreateString("deep");
+    flatbuffers::uoffset_t prev = 0;
+    for (int i = 0; i < kVeryDeep; i++) {
+      auto start = chain_fbb.StartTable();
+      if (prev) {
+        chain_fbb.AddOffset(flatbuffers::FieldIndexToOffset(2),
+                            flatbuffers::Offset<void>(prev));
+      } else {
+        chain_fbb.AddOffset(flatbuffers::FieldIndexToOffset(3), deep_name);
+      }
+      prev = chain_fbb.EndTable(start);
+    }
+    chain_fbb.Finish(flatbuffers::Offset<void>(prev));
+    std::vector<uint8_t> chain(
+        chain_fbb.GetBufferPointer(),
+        chain_fbb.GetBufferPointer() + chain_fbb.GetSize());
+
+    // Walk to the deepest node and corrupt its string terminator.
+    auto child_field = node_root.fields()->LookupByKey("child");
+    auto name_field = node_root.fields()->LookupByKey("name");
+    const flatbuffers::Table* cur = flatbuffers::GetAnyRoot(chain.data());
+    while (auto next = cur->GetPointer<const flatbuffers::Table*>(
+               child_field->offset())) {
+      cur = next;
+    }
+    auto str = cur->GetPointer<const flatbuffers::String*>(
+        name_field->offset());
+    TEST_NOTNULL(str);
+    const size_t term = (reinterpret_cast<const uint8_t*>(str) -
+                         chain.data()) +
+                        sizeof(flatbuffers::uoffset_t) + str->size();
+    chain[term] = 'Y';
+
+    flatbuffers::ReflectionVerifyOptions opts;
+    opts.max_depth = 10000;
+    opts.max_tables = 100000;
+    auto report = flatbuffers::VerifyWithReport(node_schema, node_root,
+                                                chain.data(), chain.size(),
+                                                opts);
+    TEST_EQ(report.ok, false);
+    TEST_EQ(report.failure.category,
+            flatbuffers::ReflectionVerifyError::kStringNotTerminated);
+    TEST_EQ(report.failure.byte_offset, term);
+    // The path is capped even though the chain is 5000 tables deep.
+    TEST_ASSERT(report.failure.path.size() < 128 * 80);
+    TEST_ASSERT(report.failure.path.find("/...") != std::string::npos);
+  }
+}
+
 }  // namespace tests
 }  // namespace flatbuffers
+

@@ -4,6 +4,7 @@
 
 #include "flatbuffers/flatbuffers.h"
 #include "flatbuffers/idl.h"
+#include "flatbuffers/reflection.h"
 #include "test_assert.h"
 
 namespace flatbuffers {
@@ -346,5 +347,102 @@ void FuzzTest2() {
   // clang-format on
 }
 
+// Fuzz regression for the structured reflection verifier: mutate a valid
+// buffer (nested tables, a vector of strings and a union) in random ways and
+// check that VerifyWithReport always terminates, never reads out of bounds,
+// produces well-formed failure reports, and never accepts a buffer that the
+// boolean reflection Verify() rejects.
+void FuzzReflectionVerifyReportTest() {
+  // A schema with nested tables, a vector of strings and a union.
+  flatbuffers::Parser parser;
+  TEST_EQ(parser.Parse("table Inner { val:int; s:string; }"
+                       "union Payload { Inner }"
+                       "table Node { name:string; tags:[string]; child:Node;"
+                       "  payload:Payload; }"
+                       "root_type Node;"),
+          true);
+  parser.Serialize();
+  auto& schema = *reflection::GetSchema(parser.builder_.GetBufferPointer());
+  auto& root = *schema.root_table();
+
+  // Build a valid buffer with the raw builder API.
+  flatbuffers::FlatBufferBuilder fbb;
+  auto inner_s = fbb.CreateString("inner");
+  auto inner_start = fbb.StartTable();
+  fbb.AddElement<int32_t>(flatbuffers::FieldIndexToOffset(0), 42, 0);
+  fbb.AddOffset(flatbuffers::FieldIndexToOffset(1), inner_s);
+  auto inner = fbb.EndTable(inner_start);
+  auto tag0 = fbb.CreateString("t0");
+  auto tag1 = fbb.CreateString("t1");
+  std::vector<flatbuffers::Offset<flatbuffers::String>> tags;
+  tags.push_back(tag0);
+  tags.push_back(tag1);
+  auto tags_vec = fbb.CreateVector(tags);
+  auto child_name = fbb.CreateString("child");
+  auto child_start = fbb.StartTable();
+  fbb.AddOffset(flatbuffers::FieldIndexToOffset(0), child_name);
+  auto child = fbb.EndTable(child_start);
+  auto root_name = fbb.CreateString("root");
+  auto root_start = fbb.StartTable();
+  fbb.AddOffset(flatbuffers::FieldIndexToOffset(0), root_name);
+  fbb.AddOffset(flatbuffers::FieldIndexToOffset(1), tags_vec);
+  fbb.AddOffset(flatbuffers::FieldIndexToOffset(2),
+                flatbuffers::Offset<void>(child));
+  fbb.AddElement<uint8_t>(flatbuffers::FieldIndexToOffset(3), 1, 0);
+  fbb.AddOffset(flatbuffers::FieldIndexToOffset(4),
+                flatbuffers::Offset<void>(inner));
+  fbb.Finish(flatbuffers::Offset<void>(fbb.EndTable(root_start)));
+  const std::vector<uint8_t> valid(
+      fbb.GetBufferPointer(), fbb.GetBufferPointer() + fbb.GetSize());
+
+  // The unmutated buffer passes both verifiers.
+  TEST_EQ(flatbuffers::VerifyWithReport(schema, root, valid.data(),
+                                        valid.size())
+              .ok,
+          true);
+  TEST_EQ(flatbuffers::Verify(schema, root, valid.data(), valid.size()),
+          true);
+
+  lcg_reset();
+  const int num_fuzz = 3000;
+  for (int i = 0; i < num_fuzz; i++) {
+    auto mutated = valid;
+    // Apply a few random byte mutations.
+    const int mutations = 1 + lcg_rand() % 4;
+    for (int m = 0; m < mutations; m++) {
+      mutated[lcg_rand() % mutated.size()] =
+          static_cast<uint8_t>(lcg_rand());
+    }
+    // Occasionally truncate (including to zero length).
+    size_t len = mutated.size();
+    if (lcg_rand() % 4 == 0) len = lcg_rand() % (mutated.size() + 1);
+    // Occasionally apply a small work budget or depth limit.
+    flatbuffers::ReflectionVerifyOptions opts;
+    if (lcg_rand() % 4 == 0) opts.max_work = lcg_rand() % 64;
+    if (lcg_rand() % 8 == 0) opts.max_depth = 1 + lcg_rand() % 64;
+
+    auto report = flatbuffers::VerifyWithReport(schema, root, mutated.data(),
+                                                len, opts);
+    if (report.ok) {
+      // The reporting verifier is strictly stricter than the boolean one:
+      // anything it accepts must also be accepted by Verify().
+      TEST_EQ(flatbuffers::Verify(schema, root, mutated.data(), len), true);
+      TEST_EQ(report.budget_exceeded, false);
+    } else {
+      TEST_NE(report.failure.category,
+              flatbuffers::ReflectionVerifyError::kNone);
+      // The reported location stays inside the input, and the path is
+      // bounded no matter how the buffer was corrupted.
+      TEST_ASSERT(report.failure.byte_offset <= len);
+      TEST_ASSERT(report.failure.path.size() < 128 * 80);
+      if (report.budget_exceeded) {
+        TEST_EQ(report.failure.category,
+                flatbuffers::ReflectionVerifyError::kBudgetExceeded);
+      }
+    }
+  }
+}
+
 }  // namespace tests
 }  // namespace flatbuffers
+

@@ -6,6 +6,7 @@ namespace tests {
 
 void FuzzTest1();
 void FuzzTest2();
+void FuzzReflectionVerifyReportTest();
 
 }  // namespace tests
 }  // namespace flatbuffers

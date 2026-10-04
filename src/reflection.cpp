@@ -16,6 +16,8 @@
 
 #include "flatbuffers/reflection.h"
 
+#include <unordered_set>
+
 #include "flatbuffers/util.h"
 
 // Helper functionality for reflection.
@@ -798,6 +800,597 @@ bool VerifySizePrefixed(const reflection::Schema& schema,
   Verifier v(buf, length, max_depth, max_tables);
   return VerifyObject(v, schema, root, flatbuffers::GetAnySizePrefixedRoot(buf),
                       /*required=*/true);
+}
+
+namespace {
+
+// Reflection-based verifier that, instead of a plain bool, produces a
+// structured report describing the first failure encountered: the field
+// path from the root, the innermost vector index, the byte offset relative
+// to the start of the buffer, and an error category.
+//
+// All buffer bounds and alignment checks go through a regular
+// flatbuffers::Verifier, and the depth / table-count limits mirror
+// Verifier::VerifyComplexity(). No pointer into the buffer is dereferenced
+// before the memory it refers to has been verified.
+class ReflectionReportingVerifier {
+ public:
+  ReflectionReportingVerifier(const reflection::Schema& schema,
+                              const uint8_t* buf, size_t len,
+                              const ReflectionVerifyOptions& opts)
+      : schema_(schema),
+        buf_(buf),
+        len_(len),
+        opts_(opts),
+        verifier_(buf, len, MakeVerifierOptions(opts)) {}
+
+  ReflectionVerifyReport Run(const reflection::Object& root, size_t start) {
+    if (len_ < FLATBUFFERS_MIN_BUFFER_SIZE) {
+      Fail(ReflectionVerifyError::kBufferTooSmall, 0);
+    } else {
+      const size_t o = verifier_.VerifyOffset(start);
+      if (!o) {
+        Fail(ReflectionVerifyError::kInvalidOffset, start);
+      } else {
+        VerifyObject(root, buf_ + start + o, /*required=*/true, start);
+      }
+    }
+    return Finish();
+  }
+
+  ReflectionVerifyReport RunSizePrefixed(const reflection::Object& root) {
+    if (!verifier_.Verify<uoffset_t>(0)) {
+      Fail(ReflectionVerifyError::kOutOfBounds, 0);
+      return Finish();
+    }
+    if (ReadScalar<uoffset_t>(buf_) + sizeof(uoffset_t) > len_) {
+      Fail(ReflectionVerifyError::kOutOfBounds, 0);
+      return Finish();
+    }
+    return Run(root, sizeof(uoffset_t));
+  }
+
+ private:
+  static Verifier::Options MakeVerifierOptions(
+      const ReflectionVerifyOptions& opts) {
+    Verifier::Options o;
+    o.max_depth = opts.max_depth;
+    o.max_tables = opts.max_tables;
+    o.check_alignment = opts.check_alignment;
+    return o;
+  }
+
+  // One path segment: a field name and optionally a vector index.
+  struct PathSegment {
+    std::string name;
+    size_t index;
+    bool has_index;
+  };
+
+  // Caps that bound the work spent on building the report itself, so that
+  // even a failure at the end of a very deep chain does not cause an
+  // unbounded path reconstruction.
+  static constexpr size_t kMaxPathSegments = 128;
+  static constexpr size_t kMaxSegmentNameLength = 64;
+
+  // Counts one unit of work; returns false when the (optional) budget is
+  // exhausted, flagging it separately from a content failure.
+  bool Step() {
+    if (opts_.max_work != 0 && ++work_ > opts_.max_work) {
+      budget_exceeded_ = true;
+      return Fail(ReflectionVerifyError::kBudgetExceeded, current_table_);
+    }
+    return true;
+  }
+
+  bool Fail(ReflectionVerifyError category, size_t byte_offset) {
+    if (failed_) return false;
+    failed_ = true;
+    failure_.category = category;
+    // A corrupt offset can wrap to a huge value; keep the reported offset
+    // within the buffer bounds.
+    failure_.byte_offset = byte_offset > len_ ? len_ : byte_offset;
+    failure_.path = BuildPath();
+    failure_.vector_index = kReflectionVerifyNoVectorIndex;
+    for (size_t i = path_.size(); i > 0; i--) {
+      if (path_[i - 1].has_index) {
+        failure_.vector_index = path_[i - 1].index;
+        break;
+      }
+    }
+    return false;
+  }
+
+  ReflectionVerifyReport Finish() const {
+    ReflectionVerifyReport report;
+    report.ok = !failed_;
+    report.budget_exceeded = budget_exceeded_;
+    report.failure = failure_;
+    return report;
+  }
+
+  void PushPath(const reflection::Field* field, size_t index, bool has_index) {
+    if (path_.size() >= kMaxPathSegments) {
+      // Bounded report construction: segments beyond the cap are counted
+      // but not stored, and PopPath() stays balanced.
+      path_overflow_++;
+      return;
+    }
+    PathSegment seg;
+    seg.name = (field && field->name()) ? field->name()->str() : "?";
+    if (seg.name.size() > kMaxSegmentNameLength) {
+      seg.name.resize(kMaxSegmentNameLength);
+    }
+    seg.index = index;
+    seg.has_index = has_index;
+    path_.push_back(seg);
+  }
+
+  void PushIndex(size_t index) {
+    if (path_.size() >= kMaxPathSegments) {
+      path_overflow_++;
+      return;
+    }
+    PathSegment seg;
+    seg.index = index;
+    seg.has_index = true;
+    path_.push_back(seg);
+  }
+
+  void PopPath() {
+    if (path_overflow_ > 0) {
+      path_overflow_--;
+    } else if (!path_.empty()) {
+      path_.pop_back();
+    }
+  }
+
+  std::string BuildPath() const {
+    std::string path;
+    for (size_t i = 0; i < path_.size(); i++) {
+      const PathSegment& seg = path_[i];
+      if (!seg.name.empty()) {
+        if (!path.empty()) path += ".";
+        path += seg.name;
+      }
+      if (seg.has_index) {
+        path += "[";
+        path += NumToString(seg.index);
+        path += "]";
+      }
+    }
+    if (path_overflow_ > 0) path += "/...";
+    return path;
+  }
+
+  // Verifies the uoffset stored in a table field and returns the absolute
+  // buffer offset it points to.
+  bool VerifyOffsetAt(const uint8_t* table, voffset_t field_off,
+                      size_t* target) {
+    const size_t f = static_cast<size_t>(table - buf_) + field_off;
+    if (!verifier_.VerifyAlignment(f, sizeof(uoffset_t))) {
+      return Fail(ReflectionVerifyError::kMisaligned, f);
+    }
+    if (!verifier_.Verify(f, sizeof(uoffset_t))) {
+      return Fail(ReflectionVerifyError::kOutOfBounds, f);
+    }
+    const size_t o = verifier_.VerifyOffset(f);
+    if (!o) return Fail(ReflectionVerifyError::kInvalidOffset, f);
+    *target = f + o;
+    return true;
+  }
+
+  // Verifies a string located at str_off (absolute buffer offset), including
+  // its NUL terminator.
+  bool VerifyStringAt(size_t str_off) {
+    const uint8_t* str = buf_ + str_off;
+    size_t end;
+    if (!verifier_.VerifyVectorOrString<uoffset_t>(str, 1, &end)) {
+      return Fail(ReflectionVerifyError::kOutOfBounds, str_off);
+    }
+    if (!verifier_.Verify(end, 1)) {
+      return Fail(ReflectionVerifyError::kOutOfBounds, end);
+    }
+    // Safe to read: the terminator byte was just verified to be in bounds.
+    const uoffset_t len = ReadScalar<uoffset_t>(str);
+    if (str[sizeof(uoffset_t) + len] != '\0') {
+      return Fail(ReflectionVerifyError::kStringNotTerminated, end);
+    }
+    return true;
+  }
+
+  // Verifies a union value, given its (already range-checked or to be
+  // checked here) discriminator. The discriminator and the object it
+  // selects are always validated together.
+  bool VerifyUnionAt(uint8_t utype, size_t elem_off,
+                     const reflection::Field& union_field) {
+    if (!utype) return true;  // Not present.
+    auto fb_enum = schema_.enums()->Get(union_field.type()->index());
+    if (utype >= fb_enum->values()->size()) {
+      return Fail(ReflectionVerifyError::kUnionTypeMismatch, elem_off);
+    }
+    auto elem_type = fb_enum->values()->Get(utype)->union_type();
+    switch (elem_type->base_type()) {
+      case reflection::Obj: {
+        auto elem_obj = schema_.objects()->Get(elem_type->index());
+        if (elem_obj->is_struct()) {
+          if (!verifier_.VerifyAlignment(elem_off, elem_obj->minalign())) {
+            return Fail(ReflectionVerifyError::kMisaligned, elem_off);
+          }
+          if (!verifier_.Verify(elem_off, elem_obj->bytesize())) {
+            return Fail(ReflectionVerifyError::kOutOfBounds, elem_off);
+          }
+          return true;
+        }
+        return VerifyObject(*elem_obj, buf_ + elem_off, /*required=*/true,
+                            elem_off);
+      }
+      case reflection::String:
+        return VerifyStringAt(elem_off);
+      default:
+        return Fail(ReflectionVerifyError::kUnionTypeMismatch, elem_off);
+    }
+  }
+
+  bool VerifyVectorField(const uint8_t* table, voffset_t field_off,
+                         const reflection::Field& vec_field) {
+    size_t vec_off;
+    if (!VerifyOffsetAt(table, field_off, &vec_off)) return false;
+    const uint8_t* vec = buf_ + vec_off;
+    const size_t data_off = vec_off + sizeof(uoffset_t);
+    auto elem_type = vec_field.type()->element();
+    switch (elem_type) {
+      case reflection::UType:
+      case reflection::Bool:
+      case reflection::Byte:
+      case reflection::UByte:
+      case reflection::Short:
+      case reflection::UShort:
+      case reflection::Int:
+      case reflection::UInt:
+      case reflection::Long:
+      case reflection::ULong:
+      case reflection::Float:
+      case reflection::Double: {
+        const size_t elem_size = GetTypeSize(elem_type);
+        if (!verifier_.VerifyVectorOrString<uoffset_t>(vec, elem_size)) {
+          return Fail(ReflectionVerifyError::kOutOfBounds, vec_off);
+        }
+        return true;
+      }
+      case reflection::String: {
+        if (!verifier_.VerifyVectorOrString<uoffset_t>(vec,
+                                                       sizeof(uoffset_t))) {
+          return Fail(ReflectionVerifyError::kOutOfBounds, vec_off);
+        }
+        const uoffset_t size = ReadScalar<uoffset_t>(vec);
+        for (uoffset_t j = 0; j < size; j++) {
+          if (!Step()) return false;
+          PushIndex(j);
+          const size_t elem_loc = data_off + j * sizeof(uoffset_t);
+          const size_t o = verifier_.VerifyOffset(elem_loc);
+          bool ok = o && VerifyStringAt(elem_loc + o);
+          if (!o) ok = Fail(ReflectionVerifyError::kInvalidOffset, elem_loc);
+          if (ok) {
+            PopPath();
+          } else {
+            return false;
+          }
+        }
+        return true;
+      }
+      case reflection::Obj: {
+        auto obj = schema_.objects()->Get(vec_field.type()->index());
+        if (obj->is_struct()) {
+          if (!verifier_.VerifyVectorOrString<uoffset_t>(vec,
+                                                         obj->bytesize())) {
+            return Fail(ReflectionVerifyError::kOutOfBounds, vec_off);
+          }
+          return true;
+        }
+        if (!verifier_.VerifyVectorOrString<uoffset_t>(vec,
+                                                       sizeof(uoffset_t))) {
+          return Fail(ReflectionVerifyError::kOutOfBounds, vec_off);
+        }
+        const uoffset_t size = ReadScalar<uoffset_t>(vec);
+        for (uoffset_t j = 0; j < size; j++) {
+          if (!Step()) return false;
+          PushIndex(j);
+          const size_t elem_loc = data_off + j * sizeof(uoffset_t);
+          const size_t o = verifier_.VerifyOffset(elem_loc);
+          bool ok = o && VerifyObject(*obj, buf_ + elem_loc + o,
+                                      /*required=*/true, elem_loc);
+          if (!o) ok = Fail(ReflectionVerifyError::kInvalidOffset, elem_loc);
+          if (ok) {
+            PopPath();
+          } else {
+            return false;
+          }
+        }
+        return true;
+      }
+      case reflection::Union: {
+        // The discriminator vector and the value vector are verified
+        // together.
+        if (!verifier_.VerifyVectorOrString<uoffset_t>(vec,
+                                                       sizeof(uoffset_t))) {
+          return Fail(ReflectionVerifyError::kOutOfBounds, vec_off);
+        }
+        const voffset_t type_field_off =
+            static_cast<voffset_t>(vec_field.offset() - sizeof(voffset_t));
+        auto type_off = reinterpret_cast<const Table*>(table)
+                            ->GetOptionalFieldOffset(type_field_off);
+        if (!type_off) {
+          return Fail(ReflectionVerifyError::kUnionTypeMismatch,
+                      static_cast<size_t>(table - buf_));
+        }
+        size_t type_vec_off;
+        if (!VerifyOffsetAt(table, type_off, &type_vec_off)) return false;
+        const uint8_t* type_vec = buf_ + type_vec_off;
+        if (!verifier_.VerifyVectorOrString<uoffset_t>(type_vec, 1)) {
+          return Fail(ReflectionVerifyError::kOutOfBounds, type_vec_off);
+        }
+        const uoffset_t size = ReadScalar<uoffset_t>(vec);
+        const uoffset_t type_size = ReadScalar<uoffset_t>(type_vec);
+        if (type_size != size) {
+          return Fail(ReflectionVerifyError::kUnionTypeMismatch, vec_off);
+        }
+        const uint8_t* types = type_vec + sizeof(uoffset_t);
+        for (uoffset_t j = 0; j < size; j++) {
+          if (!Step()) return false;
+          PushIndex(j);
+          const uint8_t utype = types[j];  // In bounds: verified above.
+          const size_t elem_loc = data_off + j * sizeof(uoffset_t);
+          bool ok = true;
+          if (utype) {
+            const size_t o = verifier_.VerifyOffset(elem_loc);
+            if (!o) {
+              ok = Fail(ReflectionVerifyError::kInvalidOffset, elem_loc);
+            } else {
+              ok = VerifyUnionAt(utype, elem_loc + o, vec_field);
+            }
+          }
+          if (ok) {
+            PopPath();
+          } else {
+            return false;
+          }
+        }
+        return true;
+      }
+      case reflection::Vector:
+      case reflection::None:
+      default:
+        return Fail(ReflectionVerifyError::kOutOfBounds, vec_off);
+    }
+  }
+
+  bool VerifyObject(const reflection::Object& obj, const uint8_t* table,
+                    bool required, size_t ref_off) {
+    if (!table) {
+      return !required ||
+             Fail(ReflectionVerifyError::kMissingRequiredField, ref_off);
+    }
+    if (!Step()) return false;
+    const size_t tableo = static_cast<size_t>(table - buf_);
+    // A table that was already verified is not verified again: repeated
+    // references terminate immediately, and the path of the first (actual)
+    // visit is what gets reported if it fails.
+    if (!visited_tables_.insert(tableo).second) return true;
+    const size_t saved_table = current_table_;
+    current_table_ = tableo;
+    // Mirror Verifier::VerifyComplexity() with our own counters so the
+    // failure can be categorized.
+    depth_++;
+    if (depth_ > opts_.max_depth) {
+      return Fail(ReflectionVerifyError::kDepthLimitExceeded, tableo);
+    }
+    if (++num_tables_ > opts_.max_tables) {
+      return Fail(ReflectionVerifyError::kTableLimitExceeded, tableo);
+    }
+    // Mirror Verifier::VerifyTableStart().
+    if (!verifier_.Verify<soffset_t>(tableo)) {
+      return Fail(ReflectionVerifyError::kOutOfBounds, tableo);
+    }
+    const size_t vtableo =
+        tableo - static_cast<size_t>(ReadScalar<soffset_t>(buf_ + tableo));
+    if (!verifier_.Verify<voffset_t>(vtableo)) {
+      return Fail(ReflectionVerifyError::kInvalidOffset, vtableo);
+    }
+    const voffset_t vsize = ReadScalar<voffset_t>(buf_ + vtableo);
+    if (!verifier_.VerifyAlignment(vsize, sizeof(voffset_t)) ||
+        !verifier_.Check((vsize & 1) == 0)) {
+      return Fail(ReflectionVerifyError::kMalformedVTable, vtableo);
+    }
+    if (!verifier_.Verify(vtableo, vsize)) {
+      return Fail(ReflectionVerifyError::kOutOfBounds, vtableo);
+    }
+    // The vtable is verified, so GetOptionalFieldOffset() is safe to call.
+    const Table* t = reinterpret_cast<const Table*>(table);
+    for (uoffset_t i = 0; i < obj.fields()->size(); i++) {
+      auto field_def = obj.fields()->Get(i);
+      if (!Step()) return false;
+      PushPath(field_def, 0, false);
+      const bool ok = VerifyField(t, tableo, *field_def);
+      if (ok) {
+        PopPath();
+      } else {
+        return false;  // Keep the failing path for the report.
+      }
+    }
+    depth_--;
+    current_table_ = saved_table;
+    return true;
+  }
+
+  bool VerifyField(const Table* t, size_t tableo,
+                   const reflection::Field& field_def) {
+    const voffset_t field_off = field_def.offset();
+    const auto base_type = field_def.type()->base_type();
+    if (base_type != reflection::Union) {
+      const voffset_t off = t->GetOptionalFieldOffset(field_off);
+      if (!off) {
+        // Absent fields use their default; only structs/tables/strings can
+        // be required in a way the verifier enforces.
+        const bool is_obj = base_type == reflection::Obj;
+        if (field_def.required() && is_obj) {
+          return Fail(ReflectionVerifyError::kMissingRequiredField, tableo);
+        }
+        return true;
+      }
+      const size_t f = tableo + off;
+      if (IsScalar(base_type)) {
+        const size_t size = GetTypeSize(base_type);
+        if (!verifier_.VerifyAlignment(f, size)) {
+          return Fail(ReflectionVerifyError::kMisaligned, f);
+        }
+        if (!verifier_.Verify(f, size)) {
+          return Fail(ReflectionVerifyError::kOutOfBounds, f);
+        }
+        return true;
+      }
+      switch (base_type) {
+        case reflection::String: {
+          size_t str_off;
+          return VerifyOffsetAt(reinterpret_cast<const uint8_t*>(t), off,
+                                &str_off) &&
+                 VerifyStringAt(str_off);
+        }
+        case reflection::Vector:
+          return VerifyVectorField(reinterpret_cast<const uint8_t*>(t), off,
+                                   field_def);
+        case reflection::Obj: {
+          auto child_obj = schema_.objects()->Get(field_def.type()->index());
+          if (child_obj->is_struct()) {
+            if (!verifier_.VerifyAlignment(f, child_obj->minalign())) {
+              return Fail(ReflectionVerifyError::kMisaligned, f);
+            }
+            if (!verifier_.Verify(f, child_obj->bytesize())) {
+              return Fail(ReflectionVerifyError::kOutOfBounds, f);
+            }
+            return true;
+          }
+          size_t child_off;
+          if (!VerifyOffsetAt(reinterpret_cast<const uint8_t*>(t), off,
+                              &child_off)) {
+            return false;
+          }
+          return VerifyObject(*child_obj, buf_ + child_off, /*required=*/true,
+                              child_off);
+        }
+        default:
+          return Fail(ReflectionVerifyError::kOutOfBounds, f);
+      }
+    }
+    // Union: the discriminator (the "<name>_type" field, which always
+    // immediately precedes the value field) and the value are verified
+    // together.
+    const voffset_t type_field_off =
+        static_cast<voffset_t>(field_off - sizeof(voffset_t));
+    const voffset_t type_off = t->GetOptionalFieldOffset(type_field_off);
+    uint8_t utype = 0;
+    if (type_off) {
+      const size_t tf = tableo + type_off;
+      if (!verifier_.Verify(tf, sizeof(uint8_t))) {
+        return Fail(ReflectionVerifyError::kOutOfBounds, tf);
+      }
+      utype = ReadScalar<uint8_t>(buf_ + tf);
+    }
+    const voffset_t val_off = t->GetOptionalFieldOffset(field_off);
+    if (!utype) {
+      // No member selected; a present value is inconsistent.
+      if (val_off) {
+        return Fail(ReflectionVerifyError::kUnionTypeMismatch, tableo + val_off);
+      }
+      return true;
+    }
+    if (!val_off) {
+      // Discriminator set but no value.
+      return Fail(ReflectionVerifyError::kUnionTypeMismatch, tableo);
+    }
+    size_t elem_off;
+    if (!VerifyOffsetAt(reinterpret_cast<const uint8_t*>(t), val_off,
+                        &elem_off)) {
+      return false;
+    }
+    return VerifyUnionAt(utype, elem_off, field_def);
+  }
+
+  const reflection::Schema& schema_;
+  const uint8_t* buf_;
+  const size_t len_;
+  const ReflectionVerifyOptions opts_;
+  Verifier verifier_;
+
+  bool failed_ = false;
+  bool budget_exceeded_ = false;
+  ReflectionVerifyFailure failure_;
+
+  uoffset_t depth_ = 0;
+  uoffset_t num_tables_ = 0;
+  uint64_t work_ = 0;
+  size_t current_table_ = 0;
+
+  std::unordered_set<size_t> visited_tables_;
+  std::vector<PathSegment> path_;
+  size_t path_overflow_ = 0;
+};
+
+}  // namespace
+
+const char* ReflectionVerifyErrorName(ReflectionVerifyError error) {
+  switch (error) {
+    case ReflectionVerifyError::kNone: return "none";
+    case ReflectionVerifyError::kBufferTooSmall: return "buffer too small";
+    case ReflectionVerifyError::kOutOfBounds: return "out of bounds";
+    case ReflectionVerifyError::kMisaligned: return "misaligned data";
+    case ReflectionVerifyError::kInvalidOffset: return "invalid offset";
+    case ReflectionVerifyError::kMalformedVTable: return "malformed vtable";
+    case ReflectionVerifyError::kMissingRequiredField:
+      return "missing required field";
+    case ReflectionVerifyError::kStringNotTerminated:
+      return "string not terminated";
+    case ReflectionVerifyError::kUnionTypeMismatch:
+      return "union type mismatch";
+    case ReflectionVerifyError::kDepthLimitExceeded:
+      return "depth limit exceeded";
+    case ReflectionVerifyError::kTableLimitExceeded:
+      return "table limit exceeded";
+    case ReflectionVerifyError::kBudgetExceeded: return "work budget exceeded";
+  }
+  return "unknown error";
+}
+
+std::string ReflectionVerifyReport::ToString() const {
+  if (ok) return "ok";
+  std::string s = "verification failed: ";
+  s += ReflectionVerifyErrorName(failure.category);
+  s += " at path '";
+  s += failure.path.empty() ? std::string("<root>") : failure.path;
+  s += "' (byte offset ";
+  s += NumToString(failure.byte_offset);
+  if (failure.vector_index != kReflectionVerifyNoVectorIndex) {
+    s += ", vector index ";
+    s += NumToString(failure.vector_index);
+  }
+  s += ")";
+  if (budget_exceeded) s += " [work budget exceeded]";
+  return s;
+}
+
+ReflectionVerifyReport VerifyWithReport(const reflection::Schema& schema,
+                                        const reflection::Object& root,
+                                        const uint8_t* buf, size_t length,
+                                        const ReflectionVerifyOptions& opts) {
+  ReflectionReportingVerifier verifier(schema, buf, length, opts);
+  return verifier.Run(root, 0);
+}
+
+ReflectionVerifyReport VerifySizePrefixedWithReport(
+    const reflection::Schema& schema, const reflection::Object& root,
+    const uint8_t* buf, size_t length, const ReflectionVerifyOptions& opts) {
+  ReflectionReportingVerifier verifier(schema, buf, length, opts);
+  return verifier.RunSizePrefixed(root);
 }
 
 }  // namespace flatbuffers

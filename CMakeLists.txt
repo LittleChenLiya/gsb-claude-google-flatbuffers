@@ -269,6 +269,11 @@ set(FlatBuffers_Sample_BFBS_SRCS
   samples/sample_bfbs.cpp
 )
 
+set(FlatBuffers_Sample_Reflection_Report_SRCS
+  ${FlatBuffers_Library_SRCS}
+  samples/sample_reflection_report.cpp
+)
+
 set(FlatBuffers_GRPCTest_SRCS
   include/flatbuffers/flatbuffers.h
   include/flatbuffers/grpc.h
@@ -570,6 +575,7 @@ if(FLATBUFFERS_BUILD_TESTS)
   add_executable(flatsamplebinary ${FlatBuffers_Sample_Binary_SRCS})
   add_executable(flatsampletext ${FlatBuffers_Sample_Text_SRCS})
   add_executable(flatsamplebfbs ${FlatBuffers_Sample_BFBS_SRCS})
+  add_executable(flatsamplereflectionreport ${FlatBuffers_Sample_Reflection_Report_SRCS})
 
   # Add a library so there is a single target that the generated samples can 
   # link too.
@@ -585,6 +591,7 @@ if(FLATBUFFERS_BUILD_TESTS)
   target_link_libraries(flatsamplebinary PRIVATE $<BUILD_INTERFACE:ProjectConfig> flatsample)
   target_link_libraries(flatsampletext PRIVATE $<BUILD_INTERFACE:ProjectConfig> flatsample)
   target_link_libraries(flatsamplebfbs PRIVATE $<BUILD_INTERFACE:ProjectConfig> flatsample)
+  target_link_libraries(flatsamplereflectionreport PRIVATE $<BUILD_INTERFACE:ProjectConfig> flatsample)
 
   if(FLATBUFFERS_BUILD_CPP17)
     add_executable(flattests_cpp17 ${FlatBuffers_Tests_CPP17_SRCS})

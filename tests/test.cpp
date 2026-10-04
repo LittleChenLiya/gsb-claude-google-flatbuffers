@@ -1774,6 +1774,7 @@ int FlatBufferTests(const std::string& tests_data_path) {
   FixedLengthArrayJsonTest(tests_data_path, false);
   FixedLengthArrayJsonTest(tests_data_path, true);
   ReflectionTest(tests_data_path, flatbuf.data(), flatbuf.size());
+  ReflectionVerifyReportTest(tests_data_path);
   ForAllFieldsReverseTest(tests_data_path);
   ParseProtoTest(tests_data_path);
   EvolutionTest(tests_data_path);
@@ -1802,6 +1803,7 @@ int FlatBufferTests(const std::string& tests_data_path) {
 
   FuzzTest1();
   FuzzTest2();
+  FuzzReflectionVerifyReportTest();
 
   TriviallyCopyableTest();
   ErrorTest();
