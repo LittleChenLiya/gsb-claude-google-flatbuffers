@@ -525,6 +525,38 @@ bool VerifySizePrefixed(const reflection::Schema& schema,
                         size_t length, uoffset_t max_depth = 64,
                         uoffset_t max_tables = 1000000);
 
+// Compares two flatbuffers for logical (semantic) equality using reflection.
+// root should point to the root type for these flatbuffers.
+// buf_a/buf_b should point to the start of each flatbuffer's data, and
+// length_a/length_b specify their respective sizes.
+//
+// Unlike memcmp(), this compares the values represented by the buffers, not
+// their physical layout: two buffers built in a different order (different
+// vtable layout, different object/string/vector placement) compare equal as
+// long as they encode the same data. A scalar field that is absent from one
+// buffer is treated as equal to a field explicitly storing the default value
+// in the other. Floating point NaN compares equal to NaN.
+//
+// Both buffers are verified before any comparison takes place; if either
+// buffer fails verification the function returns false and no field data is
+// accessed.
+//
+// If diff_path is non-null it is set to the path of the first difference
+// found (e.g. ".testarrayoftables[1].hp"), or to a note about which buffer
+// failed verification. It is cleared when the buffers are equal.
+bool Equal(const reflection::Schema& schema, const reflection::Object& root,
+           const uint8_t* buf_a, size_t length_a, const uint8_t* buf_b,
+           size_t length_b, std::string* diff_path = nullptr,
+           uoffset_t max_depth = 64, uoffset_t max_tables = 1000000);
+
+// Same as Equal(), but for size-prefixed buffers.
+bool EqualSizePrefixed(const reflection::Schema& schema,
+                       const reflection::Object& root, const uint8_t* buf_a,
+                       size_t length_a, const uint8_t* buf_b, size_t length_b,
+                       std::string* diff_path = nullptr,
+                       uoffset_t max_depth = 64,
+                       uoffset_t max_tables = 1000000);
+
 }  // namespace flatbuffers
 
 #endif  // FLATBUFFERS_REFLECTION_H_

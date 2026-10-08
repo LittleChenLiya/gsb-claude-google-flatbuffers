@@ -16,6 +16,9 @@
 
 #include "flatbuffers/reflection.h"
 
+#include <cmath>
+#include <cstring>
+
 #include "flatbuffers/util.h"
 
 // Helper functionality for reflection.
@@ -155,7 +158,8 @@ static bool VerifyVector(flatbuffers::Verifier& v,
       if (!vec) return true;
       auto type_vec = table.GetPointer<Vector<uint8_t>*>(vec_field.offset() -
                                                          sizeof(voffset_t));
-      if (!v.VerifyVector(type_vec)) return false;
+      // The type vector must be present when the value vector is.
+      if (!type_vec || !v.VerifyVector(type_vec)) return false;
       if (type_vec->size() != vec->size()) return false;
       for (uoffset_t j = 0; j < vec->size(); j++) {
         //  get union type from the prev field
@@ -267,6 +271,329 @@ static bool VerifyObject(flatbuffers::Verifier& v,
 
   if (!v.EndTable()) return false;
 
+  return true;
+}
+
+}  // namespace
+
+namespace {
+
+// ------------------------- LOGICAL EQUALITY -------------------------
+//
+// The helpers below recursively compare two verified buffers value by value,
+// ignoring physical layout (offsets, vtable contents, ordering of objects in
+// the buffer). They must only be called on buffers that passed verification,
+// so no bounds checking is done here.
+
+// Records the first mismatch location in `diff` (if provided) and returns
+// false, so call sites can simply `return Mismatch(path, diff);`.
+bool Mismatch(const std::string& path, std::string* diff) {
+  if (diff && diff->empty()) *diff = path;
+  return false;
+}
+
+bool FloatsEqual(double a, double b) {
+  // NaN is logically equal to NaN; otherwise use exact comparison (which
+  // also treats +0.0 and -0.0 as equal, like regular floating point ==).
+  return a == b || (std::isnan(a) && std::isnan(b));
+}
+
+// Compare two scalars of the same type located at `data_a` and `data_b`.
+bool ScalarsEqual(reflection::BaseType type, const uint8_t* data_a,
+                  const uint8_t* data_b) {
+  if (IsFloat(type)) {
+    return FloatsEqual(GetAnyValueF(type, data_a), GetAnyValueF(type, data_b));
+  }
+  return GetAnyValueI(type, data_a) == GetAnyValueI(type, data_b);
+}
+
+// True if the scalar at `data` equals the field's default value.
+bool ScalarEqualsDefault(const reflection::Field& field, const uint8_t* data) {
+  const auto type = field.type()->base_type();
+  if (type == reflection::Float) {
+    // Compare in float precision: the schema stores the default as a double,
+    // but buffers store the value rounded to a float.
+    const float value = ReadScalar<float>(data);
+    const float def = static_cast<float>(field.default_real());
+    return FloatsEqual(value, def);
+  }
+  if (type == reflection::Double) {
+    return FloatsEqual(ReadScalar<double>(data), field.default_real());
+  }
+  return GetAnyValueI(type, data) == field.default_integer();
+}
+
+bool StringsEqual(const flatbuffers::String* a, const flatbuffers::String* b) {
+  if (a == b) return true;  // Covers both being null.
+  if (!a || !b) return false;
+  return a->size() == b->size() &&
+         std::memcmp(a->data(), b->data(), a->size()) == 0;
+}
+
+// Forward declarations to resolve cyclic dependencies.
+bool TablesEqual(const reflection::Schema& schema,
+                 const reflection::Object& obj, const flatbuffers::Table* a,
+                 const flatbuffers::Table* b, const std::string& path,
+                 std::string* diff);
+bool StructsEqual(const reflection::Schema& schema,
+                  const reflection::Object& obj, const uint8_t* a,
+                  const uint8_t* b, const std::string& path,
+                  std::string* diff);
+
+// Compare two union values of the same (non-NONE) union type.
+bool UnionValuesEqual(const reflection::Schema& schema,
+                      const reflection::Enum& enum_def, uint8_t utype,
+                      const uint8_t* a, const uint8_t* b,
+                      const std::string& path, std::string* diff) {
+  const auto union_type = enum_def.values()->Get(utype)->union_type();
+  switch (union_type->base_type()) {
+    case reflection::Obj: {
+      const auto elem_obj = schema.objects()->Get(union_type->index());
+      if (elem_obj->is_struct()) {
+        return StructsEqual(schema, *elem_obj, a, b, path, diff);
+      } else {
+        return TablesEqual(schema, *elem_obj,
+                           reinterpret_cast<const flatbuffers::Table*>(a),
+                           reinterpret_cast<const flatbuffers::Table*>(b), path,
+                           diff);
+      }
+    }
+    case reflection::String:
+      if (!StringsEqual(reinterpret_cast<const flatbuffers::String*>(a),
+                        reinterpret_cast<const flatbuffers::String*>(b))) {
+        return Mismatch(path, diff);
+      }
+      return true;
+    default:
+      FLATBUFFERS_ASSERT(false);  // Verification should have caught this.
+      return false;
+  }
+}
+
+// Compare two vectors whose element type is described by `vec_type`
+// (the type of the vector field). `types_a`/`types_b` are the accompanying
+// type vectors when the element type is a union, null otherwise.
+bool VectorsEqual(const reflection::Schema& schema,
+                  const reflection::Type& vec_type,
+                  const flatbuffers::VectorOfAny* a,
+                  const flatbuffers::VectorOfAny* b,
+                  const flatbuffers::Vector<uint8_t>* types_a,
+                  const flatbuffers::Vector<uint8_t>* types_b,
+                  const std::string& path, std::string* diff) {
+  if (a->size() != b->size()) return Mismatch(path, diff);
+  const auto elem_type = vec_type.element();
+  const auto elem_size = GetTypeSizeInline(elem_type, vec_type.index(), schema);
+  for (uoffset_t i = 0; i < a->size(); i++) {
+    const std::string elem_path = path + "[" + NumToString(i) + "]";
+    if (IsScalar(elem_type)) {
+      if (!ScalarsEqual(elem_type, a->Data() + elem_size * i,
+                        b->Data() + elem_size * i)) {
+        return Mismatch(elem_path, diff);
+      }
+    } else if (elem_type == reflection::String) {
+      if (!StringsEqual(
+              GetAnyVectorElemPointer<const flatbuffers::String>(a, i),
+              GetAnyVectorElemPointer<const flatbuffers::String>(b, i))) {
+        return Mismatch(elem_path, diff);
+      }
+    } else if (elem_type == reflection::Obj) {
+      const auto elem_obj = schema.objects()->Get(vec_type.index());
+      if (elem_obj->is_struct()) {
+        if (!StructsEqual(schema, *elem_obj, a->Data() + elem_size * i,
+                          b->Data() + elem_size * i, elem_path, diff)) {
+          return false;
+        }
+      } else {
+        if (!TablesEqual(
+                schema, *elem_obj,
+                GetAnyVectorElemPointer<const flatbuffers::Table>(a, i),
+                GetAnyVectorElemPointer<const flatbuffers::Table>(b, i),
+                elem_path, diff)) {
+          return false;
+        }
+      }
+    } else if (elem_type == reflection::Union) {
+      const auto utype_a = types_a->Get(i);
+      const auto utype_b = types_b->Get(i);
+      if (utype_a != utype_b) return Mismatch(elem_path, diff);
+      if (utype_a == 0) continue;  // NONE
+      const auto enum_def = schema.enums()->Get(vec_type.index());
+      if (!UnionValuesEqual(
+              schema, *enum_def, utype_a,
+              reinterpret_cast<const uint8_t*>(
+                  GetAnyVectorElemPointer<const uint8_t>(a, i)),
+              reinterpret_cast<const uint8_t*>(
+                  GetAnyVectorElemPointer<const uint8_t>(b, i)),
+              elem_path, diff)) {
+        return false;
+      }
+    } else {
+      FLATBUFFERS_ASSERT(false);  // Verification should have caught this.
+      return false;
+    }
+  }
+  return true;
+}
+
+// Compare two structs of the same type, field by field. Struct fields are
+// always present, so no default handling is needed.
+bool StructsEqual(const reflection::Schema& schema,
+                  const reflection::Object& obj, const uint8_t* a,
+                  const uint8_t* b, const std::string& path,
+                  std::string* diff) {
+  for (uoffset_t i = 0; i < obj.fields()->size(); i++) {
+    const auto field_def = obj.fields()->Get(i);
+    const auto base_type = field_def->type()->base_type();
+    const auto field_path = path + "." + field_def->name()->str();
+    const auto data_a = a + field_def->offset();
+    const auto data_b = b + field_def->offset();
+    if (IsScalar(base_type)) {
+      if (!ScalarsEqual(base_type, data_a, data_b)) {
+        return Mismatch(field_path, diff);
+      }
+    } else if (base_type == reflection::Array) {
+      const auto elem_type = field_def->type()->element();
+      const auto count = field_def->type()->fixed_length();
+      const auto elem_size =
+          GetTypeSizeInline(elem_type, field_def->type()->index(), schema);
+      for (uoffset_t j = 0; j < count; j++) {
+        const auto elem_path = field_path + "[" + NumToString(j) + "]";
+        if (IsScalar(elem_type)) {
+          if (!ScalarsEqual(elem_type, data_a + elem_size * j,
+                            data_b + elem_size * j)) {
+            return Mismatch(elem_path, diff);
+          }
+        } else {
+          FLATBUFFERS_ASSERT(elem_type == reflection::Obj);
+          const auto elem_obj =
+              schema.objects()->Get(field_def->type()->index());
+          if (!StructsEqual(schema, *elem_obj, data_a + elem_size * j,
+                            data_b + elem_size * j, elem_path, diff)) {
+            return false;
+          }
+        }
+      }
+    } else {
+      FLATBUFFERS_ASSERT(base_type == reflection::Obj);
+      const auto elem_obj = schema.objects()->Get(field_def->type()->index());
+      if (!StructsEqual(schema, *elem_obj, data_a, data_b, field_path, diff)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// Compare two tables of the same type, field by field. Absent scalar fields
+// are treated as equal to fields explicitly storing the default value.
+bool TablesEqual(const reflection::Schema& schema,
+                 const reflection::Object& obj, const flatbuffers::Table* a,
+                 const flatbuffers::Table* b, const std::string& path,
+                 std::string* diff) {
+  for (uoffset_t i = 0; i < obj.fields()->size(); i++) {
+    const auto field_def = obj.fields()->Get(i);
+    const auto base_type = field_def->type()->base_type();
+    const auto field_path = path + "." + field_def->name()->str();
+    if (IsScalar(base_type)) {
+      const auto data_a = a->GetAddressOf(field_def->offset());
+      const auto data_b = b->GetAddressOf(field_def->offset());
+      if (data_a && data_b) {
+        if (!ScalarsEqual(base_type, data_a, data_b)) {
+          return Mismatch(field_path, diff);
+        }
+      } else if (data_a || data_b) {
+        // Present in exactly one buffer: must equal the default value.
+        if (!ScalarEqualsDefault(*field_def, data_a ? data_a : data_b)) {
+          return Mismatch(field_path, diff);
+        }
+      }
+      continue;
+    }
+    switch (base_type) {
+      case reflection::String: {
+        const auto str_a = flatbuffers::GetFieldS(*a, *field_def);
+        const auto str_b = flatbuffers::GetFieldS(*b, *field_def);
+        if (!StringsEqual(str_a, str_b)) return Mismatch(field_path, diff);
+        break;
+      }
+      case reflection::Vector: {
+        const auto vec_a = flatbuffers::GetFieldAnyV(*a, *field_def);
+        const auto vec_b = flatbuffers::GetFieldAnyV(*b, *field_def);
+        if (!vec_a || !vec_b) {
+          if (vec_a != vec_b) return Mismatch(field_path, diff);
+          break;
+        }
+        // For vectors of unions, locate the accompanying type vectors.
+        const flatbuffers::Vector<uint8_t>* types_a = nullptr;
+        const flatbuffers::Vector<uint8_t>* types_b = nullptr;
+        if (field_def->type()->element() == reflection::Union) {
+          types_a = a->GetPointer<flatbuffers::Vector<uint8_t>*>(
+              field_def->offset() - sizeof(voffset_t));
+          types_b = b->GetPointer<flatbuffers::Vector<uint8_t>*>(
+              field_def->offset() - sizeof(voffset_t));
+          // Verification guarantees the type vectors are present.
+          if (!types_a || !types_b) return Mismatch(field_path, diff);
+        }
+        if (!VectorsEqual(schema, *field_def->type(), vec_a, vec_b, types_a,
+                          types_b, field_path, diff)) {
+          return false;
+        }
+        break;
+      }
+      case reflection::Obj: {
+        const auto child_obj =
+            schema.objects()->Get(field_def->type()->index());
+        if (child_obj->is_struct()) {
+          const auto struct_a =
+              a->GetStruct<const uint8_t*>(field_def->offset());
+          const auto struct_b =
+              b->GetStruct<const uint8_t*>(field_def->offset());
+          if (!struct_a || !struct_b) {
+            if (struct_a != struct_b) return Mismatch(field_path, diff);
+            break;
+          }
+          if (!StructsEqual(schema, *child_obj, struct_a, struct_b, field_path,
+                            diff)) {
+            return false;
+          }
+        } else {
+          const auto table_a = flatbuffers::GetFieldT(*a, *field_def);
+          const auto table_b = flatbuffers::GetFieldT(*b, *field_def);
+          if (!table_a || !table_b) {
+            if (table_a != table_b) return Mismatch(field_path, diff);
+            break;
+          }
+          if (!TablesEqual(schema, *child_obj, table_a, table_b, field_path,
+                           diff)) {
+            return false;
+          }
+        }
+        break;
+      }
+      case reflection::Union: {
+        // The union type is stored in the field preceding the value.
+        const auto utype_offset = field_def->offset() - sizeof(voffset_t);
+        const auto utype_a = a->GetField<uint8_t>(utype_offset, 0);
+        const auto utype_b = b->GetField<uint8_t>(utype_offset, 0);
+        if (utype_a != utype_b) return Mismatch(field_path, diff);
+        if (utype_a == 0) break;  // NONE
+        const auto enum_def = schema.enums()->Get(field_def->type()->index());
+        if (!UnionValuesEqual(
+                schema, *enum_def, utype_a,
+                reinterpret_cast<const uint8_t*>(
+                    flatbuffers::GetFieldT(*a, *field_def)),
+                reinterpret_cast<const uint8_t*>(
+                    flatbuffers::GetFieldT(*b, *field_def)),
+                field_path, diff)) {
+          return false;
+        }
+        break;
+      }
+      default:
+        FLATBUFFERS_ASSERT(false);  // Verification should have caught this.
+        return false;
+    }
+  }
   return true;
 }
 
@@ -798,6 +1125,48 @@ bool VerifySizePrefixed(const reflection::Schema& schema,
   Verifier v(buf, length, max_depth, max_tables);
   return VerifyObject(v, schema, root, flatbuffers::GetAnySizePrefixedRoot(buf),
                       /*required=*/true);
+}
+
+bool Equal(const reflection::Schema& schema, const reflection::Object& root,
+           const uint8_t* const buf_a, const size_t length_a,
+           const uint8_t* const buf_b, const size_t length_b,
+           std::string* diff_path, const uoffset_t max_depth,
+           const uoffset_t max_tables) {
+  // Never draw conclusions from unverified data: both buffers must pass
+  // verification before any comparison takes place.
+  if (!Verify(schema, root, buf_a, length_a, max_depth, max_tables)) {
+    if (diff_path) *diff_path = "<first buffer failed verification>";
+    return false;
+  }
+  if (!Verify(schema, root, buf_b, length_b, max_depth, max_tables)) {
+    if (diff_path) *diff_path = "<second buffer failed verification>";
+    return false;
+  }
+  if (diff_path) diff_path->clear();
+  return TablesEqual(schema, root, flatbuffers::GetAnyRoot(buf_a),
+                     flatbuffers::GetAnyRoot(buf_b), "", diff_path);
+}
+
+bool EqualSizePrefixed(const reflection::Schema& schema,
+                       const reflection::Object& root,
+                       const uint8_t* const buf_a, const size_t length_a,
+                       const uint8_t* const buf_b, const size_t length_b,
+                       std::string* diff_path, const uoffset_t max_depth,
+                       const uoffset_t max_tables) {
+  if (!VerifySizePrefixed(schema, root, buf_a, length_a, max_depth,
+                          max_tables)) {
+    if (diff_path) *diff_path = "<first buffer failed verification>";
+    return false;
+  }
+  if (!VerifySizePrefixed(schema, root, buf_b, length_b, max_depth,
+                          max_tables)) {
+    if (diff_path) *diff_path = "<second buffer failed verification>";
+    return false;
+  }
+  if (diff_path) diff_path->clear();
+  return TablesEqual(schema, root, flatbuffers::GetAnySizePrefixedRoot(buf_a),
+                     flatbuffers::GetAnySizePrefixedRoot(buf_b), "",
+                     diff_path);
 }
 
 }  // namespace flatbuffers

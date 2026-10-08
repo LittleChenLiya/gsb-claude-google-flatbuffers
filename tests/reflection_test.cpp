@@ -1,5 +1,9 @@
 #include "reflection_test.h"
 
+#include <cstring>
+#include <limits>
+
+#include "flatbuffers/idl.h"
 #include "flatbuffers/minireflect.h"
 #include "flatbuffers/reflection.h"
 #include "flatbuffers/reflection_generated.h"
@@ -8,6 +12,7 @@
 #include "monster_test_generated.h"
 #include "test_assert.h"
 #include "tests/arrays_test_generated.h"
+#include "tests/union_vector/union_vector_generated.h"
 
 namespace flatbuffers {
 namespace tests {
@@ -407,6 +412,551 @@ void MiniReflectFixedLengthArrayTest() {
       "}",
       s.c_str());
 #endif
+}
+
+namespace {
+
+// Describes the logical contents of a Monster buffer used by the equality
+// tests. Two buffers built from the same spec are logically identical, even
+// if they were laid out differently.
+struct EqualityMonsterSpec {
+  int16_t hp = 80;
+  int16_t sub_hp1 = 20;
+  float pos_x = 1.0f;
+  int16_t pos_test3_a = 10;
+  bool set_testf3 = false;
+  float testf3 = 0.0f;
+  const char* name = "MyMonster";
+  const char* strvec1 = "two";
+  int8_t test4_1_b = 20;
+  double vec_double1 = 2.5;
+  MyGame::Example::Color union_color = MyGame::Example::Color_Red;
+  bool use_monster_union = false;
+  bool omit_union = false;
+  bool empty_inventory = false;
+};
+
+// Builds a Monster buffer from `spec`. When `alt_layout` is true the same
+// logical contents are produced with a different physical layout: objects
+// are created in a different order and default-valued scalar fields are
+// physically written out (ForceDefaults), producing a different vtable.
+std::vector<uint8_t> BuildEqualityMonster(const EqualityMonsterSpec& spec,
+                                          bool alt_layout,
+                                          bool size_prefixed = false) {
+  using namespace MyGame::Example;
+  flatbuffers::FlatBufferBuilder fbb;
+  if (alt_layout) fbb.ForceDefaults(true);
+
+  flatbuffers::Offset<flatbuffers::String> root_name, str_one, str_two;
+  flatbuffers::Offset<Monster> sub0, sub1;
+
+  auto make_strings = [&]() {
+    root_name = fbb.CreateString(spec.name);
+    str_one = fbb.CreateString("one");
+    str_two = fbb.CreateString(spec.strvec1);
+  };
+  auto make_subs = [&]() {
+    auto sub0_name = fbb.CreateString("sub0");
+    MonsterBuilder sub0_builder(fbb);
+    sub0_builder.add_name(sub0_name);
+    sub0_builder.add_hp(10);
+    sub0 = sub0_builder.Finish();
+    auto sub1_name = fbb.CreateString("sub1");
+    MonsterBuilder sub1_builder(fbb);
+    sub1_builder.add_name(sub1_name);
+    sub1_builder.add_hp(spec.sub_hp1);
+    sub1 = sub1_builder.Finish();
+  };
+  // Vary the physical order in which objects are created.
+  if (alt_layout) {
+    make_strings();
+    make_subs();
+  } else {
+    make_subs();
+    make_strings();
+  }
+
+  const uint8_t inv_data[] = { 1, 2, 3, 4 };
+  auto inventory = spec.empty_inventory
+                       ? fbb.CreateVector(inv_data, 0)
+                       : fbb.CreateVector(inv_data, 4);
+  const std::vector<flatbuffers::Offset<flatbuffers::String>> strings = {
+    str_one, str_two
+  };
+  auto strvec = fbb.CreateVector(strings);
+  const std::vector<flatbuffers::Offset<Monster>> tables = { sub0, sub1 };
+  auto tablesvec = fbb.CreateVector(tables);
+  const Test test_structs[] = { Test(1, 2), Test(10, spec.test4_1_b) };
+  auto test4 = fbb.CreateVectorOfStructs(test_structs, 2);
+  const double dbl_data[] = { 1.5, spec.vec_double1 };
+  auto dbls = fbb.CreateVector(dbl_data, 2);
+
+  flatbuffers::Offset<void> union_val;
+  Any union_type = Any_NONE;
+  if (!spec.omit_union) {
+    if (spec.use_monster_union) {
+      auto union_name = fbb.CreateString("unionmonster");
+      MonsterBuilder union_builder(fbb);
+      union_builder.add_name(union_name);
+      union_builder.add_hp(5);
+      union_val = union_builder.Finish().Union();
+      union_type = Any_Monster;
+    } else {
+      union_val =
+          CreateTestSimpleTableWithEnum(fbb, spec.union_color).Union();
+      union_type = Any_TestSimpleTableWithEnum;
+    }
+  }
+
+  Vec3 pos(spec.pos_x, 2.0f, 3.0f, 4.5, Color_Red,
+           Test(spec.pos_test3_a, 20));
+
+  MonsterBuilder builder(fbb);
+  builder.add_pos(&pos);
+  builder.add_hp(spec.hp);
+  builder.add_mana(150);        // Default: dropped unless ForceDefaults.
+  builder.add_testf(3.14159f);  // Default: dropped unless ForceDefaults.
+  builder.add_name(root_name);
+  builder.add_inventory(inventory);
+  builder.add_testarrayofstring(strvec);
+  builder.add_testarrayoftables(tablesvec);
+  builder.add_test4(test4);
+  builder.add_vector_of_doubles(dbls);
+  if (spec.set_testf3) builder.add_testf3(spec.testf3);
+  if (!spec.omit_union) {
+    builder.add_test_type(union_type);
+    builder.add_test(union_val);
+  }
+  auto monster = builder.Finish();
+  if (size_prefixed) {
+    fbb.FinishSizePrefixed(monster);
+  } else {
+    fbb.Finish(monster);
+  }
+  const auto* begin = fbb.GetBufferPointer();
+  return std::vector<uint8_t>(begin, begin + fbb.GetSize());
+}
+
+// Builds a Movie buffer (union_vector.fbs) exercising vectors of unions
+// containing tables, structs and strings.
+std::vector<uint8_t> BuildEqualityMovie(bool alt_layout, int32_t sword_damage,
+                                        int32_t belle_books) {
+  flatbuffers::FlatBufferBuilder fbb;
+  if (alt_layout) fbb.ForceDefaults(true);
+
+  auto make_main = [&]() {
+    return CreateAttacker(fbb, /*sword_attack_damage=*/42).Union();
+  };
+  auto make_strings = [&]() {
+    return std::vector<flatbuffers::Offset<void>>{
+      fbb.CreateString("Other").Union(), fbb.CreateString("Unused").Union()
+    };
+  };
+  flatbuffers::Offset<void> main_character;
+  std::vector<flatbuffers::Offset<void>> union_strings;
+  // Vary the physical creation order between the two layouts.
+  if (alt_layout) {
+    union_strings = make_strings();
+    main_character = make_main();
+  } else {
+    main_character = make_main();
+    union_strings = make_strings();
+  }
+
+  std::vector<flatbuffers::Offset<void>> characters;
+  characters.push_back(fbb.CreateStruct(BookReader(belle_books)).Union());
+  characters.push_back(CreateAttacker(fbb, sword_damage).Union());
+  characters.push_back(fbb.CreateStruct(BookReader(2)).Union());
+  characters.push_back(union_strings[0]);
+  characters.push_back(union_strings[1]);
+  const std::vector<uint8_t> types(
+      { static_cast<uint8_t>(Character_Belle),
+        static_cast<uint8_t>(Character_MuLan),
+        static_cast<uint8_t>(Character_BookFan),
+        static_cast<uint8_t>(Character_Other),
+        static_cast<uint8_t>(Character_Unused) });
+  auto characters_vec = fbb.CreateVector(characters);
+  auto types_vec = fbb.CreateVector(types);
+
+  MovieBuilder builder(fbb);
+  builder.add_main_character_type(Character_MuLan);
+  builder.add_main_character(main_character);
+  builder.add_characters_type(types_vec);
+  builder.add_characters(characters_vec);
+  auto movie = builder.Finish();
+  fbb.Finish(movie);
+  const auto* begin = fbb.GetBufferPointer();
+  return std::vector<uint8_t>(begin, begin + fbb.GetSize());
+}
+
+// Builds an ArrayTable buffer (arrays_test.fbs) exercising fixed-length
+// arrays and nested structs inside structs.
+std::vector<uint8_t> BuildEqualityArrayTable(int32_t b3, int32_t d1_a0) {
+  flatbuffers::FlatBufferBuilder fbb;
+  MyGame::Example::ArrayStruct array_struct(2.0f, 12, 1);
+  array_struct.mutable_b()->Mutate(3, b3);
+  array_struct.mutable_d()->GetMutablePointer(1)->mutable_a()->Mutate(0,
+                                                                       d1_a0);
+  auto table = MyGame::Example::CreateArrayTable(fbb, &array_struct);
+  fbb.Finish(table);
+  const auto* begin = fbb.GetBufferPointer();
+  return std::vector<uint8_t>(begin, begin + fbb.GetSize());
+}
+
+bool BuffersDifferBytewise(const std::vector<uint8_t>& a,
+                           const std::vector<uint8_t>& b) {
+  return a.size() != b.size() ||
+         std::memcmp(a.data(), b.data(), a.size()) != 0;
+}
+
+}  // namespace
+
+void ReflectionEqualityTest(const std::string& tests_data_path) {
+  // Load the binary schema.
+  std::string bfbsfile;
+  TEST_EQ(flatbuffers::LoadFile((tests_data_path + "monster_test.bfbs").c_str(),
+                                true, &bfbsfile),
+          true);
+  auto& schema = *reflection::GetSchema(bfbsfile.c_str());
+  auto& root = *schema.root_table();
+
+  const EqualityMonsterSpec spec;
+  const auto buf_a = BuildEqualityMonster(spec, false);
+  const auto buf_b = BuildEqualityMonster(spec, true);
+
+  // The two buffers encode the same data but must NOT be byte-identical,
+  // proving that Equal() below is not a memcmp().
+  TEST_ASSERT(BuffersDifferBytewise(buf_a, buf_b));
+
+  std::string diff = "sentinel";
+  TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                             buf_b.data(), buf_b.size(), &diff),
+          true);
+  TEST_ASSERT(diff.empty());
+
+  // A buffer always equals itself.
+  TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                             buf_a.data(), buf_a.size()),
+          true);
+
+  // Default-valued fields: hp=100 is the schema default, so buf_a omits it
+  // while the ForceDefaults buffer writes it out explicitly. Same for
+  // mana=150 and testf=3.14159 in the buffers above.
+  {
+    EqualityMonsterSpec def = spec;
+    def.hp = 100;
+    const auto def_a = BuildEqualityMonster(def, false);
+    const auto def_b = BuildEqualityMonster(def, true);
+    TEST_ASSERT(BuffersDifferBytewise(def_a, def_b));
+    TEST_EQ(flatbuffers::Equal(schema, root, def_a.data(), def_a.size(),
+                               def_b.data(), def_b.size()),
+            true);
+  }
+
+  // Changing one element of a nested vector of tables must be reported at
+  // the exact location.
+  {
+    EqualityMonsterSpec mod = spec;
+    mod.sub_hp1 = 21;
+    const auto buf_c = BuildEqualityMonster(mod, false);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               buf_c.data(), buf_c.size(), &d),
+            false);
+    TEST_EQ_STR(".testarrayoftables[1].hp", d.c_str());
+  }
+
+  // Changing one element of a vector of structs.
+  {
+    EqualityMonsterSpec mod = spec;
+    mod.test4_1_b = 21;
+    const auto buf_c = BuildEqualityMonster(mod, false);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               buf_c.data(), buf_c.size(), &d),
+            false);
+    TEST_EQ_STR(".test4[1].b", d.c_str());
+  }
+
+  // Changing one element of a vector of scalars.
+  {
+    EqualityMonsterSpec mod = spec;
+    mod.vec_double1 = 3.5;
+    const auto buf_c = BuildEqualityMonster(mod, false);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               buf_c.data(), buf_c.size(), &d),
+            false);
+    TEST_EQ_STR(".vector_of_doubles[1]", d.c_str());
+  }
+
+  // Changing one string inside a vector of strings.
+  {
+    EqualityMonsterSpec mod = spec;
+    mod.strvec1 = "changed";
+    const auto buf_c = BuildEqualityMonster(mod, false);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               buf_c.data(), buf_c.size(), &d),
+            false);
+    TEST_EQ_STR(".testarrayofstring[1]", d.c_str());
+  }
+
+  // Changing the root string and a root scalar.
+  {
+    EqualityMonsterSpec mod = spec;
+    mod.name = "OtherMonster";
+    const auto buf_c = BuildEqualityMonster(mod, false);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               buf_c.data(), buf_c.size(), &d),
+            false);
+    TEST_EQ_STR(".name", d.c_str());
+  }
+  {
+    EqualityMonsterSpec mod = spec;
+    mod.hp = 81;
+    const auto buf_c = BuildEqualityMonster(mod, false);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               buf_c.data(), buf_c.size(), &d),
+            false);
+    TEST_EQ_STR(".hp", d.c_str());
+  }
+
+  // Changing a scalar inside a struct inside the root table.
+  {
+    EqualityMonsterSpec mod = spec;
+    mod.pos_test3_a = 11;
+    const auto buf_c = BuildEqualityMonster(mod, false);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               buf_c.data(), buf_c.size(), &d),
+            false);
+    TEST_EQ_STR(".pos.test3.a", d.c_str());
+  }
+
+  // NaN handling: NaN is logically equal to NaN, but not to a number.
+  {
+    EqualityMonsterSpec nan_spec = spec;
+    nan_spec.set_testf3 = true;
+    nan_spec.testf3 = std::numeric_limits<float>::quiet_NaN();
+    const auto nan_a = BuildEqualityMonster(nan_spec, false);
+    const auto nan_b = BuildEqualityMonster(nan_spec, true);
+    TEST_ASSERT(BuffersDifferBytewise(nan_a, nan_b));
+    TEST_EQ(flatbuffers::Equal(schema, root, nan_a.data(), nan_a.size(),
+                               nan_b.data(), nan_b.size()),
+            true);
+
+    EqualityMonsterSpec zero_spec = spec;
+    zero_spec.set_testf3 = true;
+    zero_spec.testf3 = 0.0f;
+    const auto zero = BuildEqualityMonster(zero_spec, false);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, nan_a.data(), nan_a.size(),
+                               zero.data(), zero.size(), &d),
+            false);
+    TEST_EQ_STR(".testf3", d.c_str());
+
+    // NaN inside a struct field compares equal too.
+    EqualityMonsterSpec nan_pos = spec;
+    nan_pos.pos_x = std::numeric_limits<float>::quiet_NaN();
+    const auto nan_pos_a = BuildEqualityMonster(nan_pos, false);
+    const auto nan_pos_b = BuildEqualityMonster(nan_pos, true);
+    TEST_EQ(flatbuffers::Equal(schema, root, nan_pos_a.data(),
+                               nan_pos_a.size(), nan_pos_b.data(),
+                               nan_pos_b.size()),
+            true);
+  }
+
+  // Unions: same type and contents compare equal, different contents or
+  // different types do not.
+  {
+    EqualityMonsterSpec mod = spec;
+    mod.union_color = MyGame::Example::Color_Blue;
+    const auto buf_c = BuildEqualityMonster(mod, false);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               buf_c.data(), buf_c.size(), &d),
+            false);
+    TEST_EQ_STR(".test.color", d.c_str());
+  }
+  {
+    EqualityMonsterSpec mod = spec;
+    mod.use_monster_union = true;
+    const auto buf_c = BuildEqualityMonster(mod, false);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               buf_c.data(), buf_c.size(), &d),
+            false);
+    // The union type differs; the schema lists the value field "test"
+    // before its type field "test_type" (fields are sorted by name).
+    TEST_EQ_STR(".test", d.c_str());
+  }
+  {
+    EqualityMonsterSpec mod = spec;
+    mod.omit_union = true;
+    const auto buf_c = BuildEqualityMonster(mod, false);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               buf_c.data(), buf_c.size(), &d),
+            false);
+    // The union is present in one buffer only; "test" sorts before
+    // "test_type" in the schema, so it is reported first.
+    TEST_EQ_STR(".test", d.c_str());
+  }
+
+  // A missing vector and an explicitly empty vector are not the same.
+  {
+    EqualityMonsterSpec mod = spec;
+    mod.empty_inventory = true;
+    const auto buf_c = BuildEqualityMonster(mod, false);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               buf_c.data(), buf_c.size(), &d),
+            false);
+    TEST_EQ_STR(".inventory", d.c_str());
+  }
+
+  // Corrupted buffers must never compare equal (and must not crash):
+  // verification happens before any comparison.
+  {
+    // Truncated buffer.
+    auto truncated = buf_a;
+    truncated.resize(truncated.size() - 8);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               truncated.data(), truncated.size(), &d),
+            false);
+    TEST_EQ_STR("<second buffer failed verification>", d.c_str());
+  }
+  {
+    // Root table offset pointing outside the buffer.
+    auto corrupt = buf_a;
+    flatbuffers::WriteScalar(corrupt.data(),
+                             static_cast<flatbuffers::uoffset_t>(0xFFFFFFF0));
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, corrupt.data(), corrupt.size(),
+                               buf_a.data(), buf_a.size(), &d),
+            false);
+    TEST_EQ_STR("<first buffer failed verification>", d.c_str());
+  }
+  {
+    // Corrupt the root offset to point at the very end of the buffer, where
+    // no valid table can start.
+    auto corrupt = buf_a;
+    flatbuffers::WriteScalar(
+        corrupt.data(),
+        static_cast<flatbuffers::uoffset_t>(corrupt.size() - 2));
+    TEST_EQ(flatbuffers::Equal(schema, root, buf_a.data(), buf_a.size(),
+                               corrupt.data(), corrupt.size()),
+            false);
+  }
+
+  // Size-prefixed buffers.
+  {
+    const auto sp_a = BuildEqualityMonster(spec, false, true);
+    const auto sp_b = BuildEqualityMonster(spec, true, true);
+    TEST_ASSERT(BuffersDifferBytewise(sp_a, sp_b));
+    TEST_EQ(flatbuffers::EqualSizePrefixed(schema, root, sp_a.data(),
+                                           sp_a.size(), sp_b.data(),
+                                           sp_b.size()),
+            true);
+    EqualityMonsterSpec mod = spec;
+    mod.hp = 81;
+    const auto sp_c = BuildEqualityMonster(mod, false, true);
+    std::string d;
+    TEST_EQ(flatbuffers::EqualSizePrefixed(schema, root, sp_a.data(),
+                                           sp_a.size(), sp_c.data(),
+                                           sp_c.size(), &d),
+            false);
+    TEST_EQ_STR(".hp", d.c_str());
+  }
+}
+
+void ReflectionEqualityUnionVectorTest(const std::string& tests_data_path) {
+  // Build a reflection schema for union_vector.fbs at runtime.
+  std::string schemafile;
+  TEST_EQ(flatbuffers::LoadFile(
+              (tests_data_path + "union_vector/union_vector.fbs").c_str(),
+              false, &schemafile),
+          true);
+  flatbuffers::IDLOptions idl_opts;
+  idl_opts.lang_to_generate |= flatbuffers::IDLOptions::kBinary;
+  flatbuffers::Parser parser(idl_opts);
+  TEST_EQ(parser.Parse(schemafile.c_str()), true);
+  parser.Serialize();
+  auto& schema = *reflection::GetSchema(parser.builder_.GetBufferPointer());
+  auto& root = *schema.root_table();
+
+  const auto movie_a = BuildEqualityMovie(false, /*sword_damage=*/5,
+                                          /*belle_books=*/7);
+  const auto movie_b = BuildEqualityMovie(true, /*sword_damage=*/5,
+                                          /*belle_books=*/7);
+
+  // Same logical contents, different physical layout.
+  TEST_ASSERT(BuffersDifferBytewise(movie_a, movie_b));
+  TEST_EQ(flatbuffers::Equal(schema, root, movie_a.data(), movie_a.size(),
+                             movie_b.data(), movie_b.size()),
+          true);
+
+  // Change a table inside a vector of unions.
+  {
+    const auto movie_c = BuildEqualityMovie(false, /*sword_damage=*/6,
+                                            /*belle_books=*/7);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, movie_a.data(), movie_a.size(),
+                               movie_c.data(), movie_c.size(), &d),
+            false);
+    TEST_EQ_STR(".characters[1].sword_attack_damage", d.c_str());
+  }
+
+  // Change a struct inside a vector of unions.
+  {
+    const auto movie_c = BuildEqualityMovie(false, /*sword_damage=*/5,
+                                            /*belle_books=*/8);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, movie_a.data(), movie_a.size(),
+                               movie_c.data(), movie_c.size(), &d),
+            false);
+    TEST_EQ_STR(".characters[0].books_read", d.c_str());
+  }
+}
+
+void ReflectionEqualityArrayTest(const std::string& tests_data_path) {
+  // Load the binary schema for arrays_test.fbs.
+  std::string bfbsfile;
+  TEST_EQ(flatbuffers::LoadFile((tests_data_path + "arrays_test.bfbs").c_str(),
+                                true, &bfbsfile),
+          true);
+  auto& schema = *reflection::GetSchema(bfbsfile.c_str());
+  auto& root = *schema.root_table();
+
+  const auto arr_a = BuildEqualityArrayTable(/*b3=*/42, /*d1_a0=*/7);
+  const auto arr_b = BuildEqualityArrayTable(/*b3=*/42, /*d1_a0=*/7);
+  TEST_EQ(flatbuffers::Equal(schema, root, arr_a.data(), arr_a.size(),
+                             arr_b.data(), arr_b.size()),
+          true);
+
+  // Change one element of a fixed-length int array inside a struct.
+  {
+    const auto arr_c = BuildEqualityArrayTable(/*b3=*/43, /*d1_a0=*/7);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, arr_a.data(), arr_a.size(),
+                               arr_c.data(), arr_c.size(), &d),
+            false);
+    TEST_EQ_STR(".a.b[3]", d.c_str());
+  }
+
+  // Change one element of an int array inside a nested struct array.
+  {
+    const auto arr_c = BuildEqualityArrayTable(/*b3=*/42, /*d1_a0=*/8);
+    std::string d;
+    TEST_EQ(flatbuffers::Equal(schema, root, arr_a.data(), arr_a.size(),
+                               arr_c.data(), arr_c.size(), &d),
+            false);
+    TEST_EQ_STR(".a.d[1].a[0]", d.c_str());
+  }
 }
 
 }  // namespace tests
