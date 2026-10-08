@@ -230,6 +230,7 @@ set(FlatBuffers_Tests_SRCS
   tests/parser_test.cpp
   tests/proto_test.cpp
   tests/reflection_test.cpp
+  tests/reflection_compare_test.cpp
   tests/test.cpp
   tests/test_assert.h
   tests/test_assert.cpp
@@ -560,6 +561,7 @@ if(FLATBUFFERS_BUILD_TESTS)
   compile_schema_for_test(tests/64bit/evolution/v2.fbs "${FLATC_OPT_COMP}")
   compile_schema_for_test(tests/union_underlying_type_test.fbs "${FLATC_OPT_SCOPED_ENUMS}")
   compile_schema_for_test(tests/cross_namespace_pack_test.fbs "${FLATC_OPT_COMP}")
+  compile_schema_for_test(tests/reflection_compare_test.fbs "${FLATC_OPT_COMP}")
 
   if(FLATBUFFERS_CODE_SANITIZE)
     add_fsanitize_to_target(flattests ${FLATBUFFERS_CODE_SANITIZE})

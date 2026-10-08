@@ -525,6 +525,87 @@ bool VerifySizePrefixed(const reflection::Schema& schema,
                         size_t length, uoffset_t max_depth = 64,
                         uoffset_t max_tables = 1000000);
 
+// ------------------------- COMPARISON -------------------------
+
+// Result of a reflection-based logical comparison between two FlatBuffers.
+// Two buffers can be byte-for-byte different (different construction order,
+// different vtable layouts, different offsets, shared vs. duplicated vtables)
+// yet logically equal, so equality is established by recursively comparing
+// values through the schema rather than by a memcmp of the raw bytes.
+struct CompareResult {
+  // True if the two inputs are logically equal (or both failed verification,
+  // see CompareOptions::equal_invalid_buffers).
+  bool equal;
+
+  // Human readable description of why the inputs are not equal.
+  // Empty when `equal` is true. Possible forms:
+  //   "verification failed (first buffer)"
+  //   "<value> != <value>"                  // scalar mismatch, see `path`
+  //   "union type <A> != <B>"               // mismatching union types
+  //   "present != absent"                   // table/string/vector presence
+  std::string error;
+
+  // Logical path of the first differing value, e.g. "inventory[3]".
+  // Empty when `equal` is true or when verification fails.
+  std::string path;
+
+  CompareResult() : equal(true) {}
+  CompareResult(bool e, std::string err, std::string p = "")
+      : equal(e), error(std::move(err)), path(std::move(p)) {}
+
+  explicit operator bool() const { return equal; }
+};
+
+// Options controlling how reflection-based comparison is performed.
+struct CompareOptions {
+  CompareOptions()
+      : max_depth(64),
+        max_tables(1000000),
+        compare_nan_equal(true),
+        equal_invalid_buffers(false) {}
+
+  // Maximum nested object depth passed to the verifier and used while
+  // recursively comparing.
+  uoffset_t max_depth;
+  // Maximum number of tables passed to the verifier.
+  uoffset_t max_tables;
+  // If true (the default), NaN floating point values compare equal to each
+  // other regardless of NaN payload, matching the notion of "same logical
+  // value". If false, NaNs are compared bitwise like all other scalars.
+  bool compare_nan_equal;
+  // If true, two buffers that both fail verification are reported as equal.
+  // By default any invalid buffer makes the comparison unequal.
+  bool equal_invalid_buffers;
+};
+
+// Logically compare two FlatBuffers against the same reflection schema.
+// Both buffers are verified first; comparison then recursively walks tables,
+// structs, vectors, strings and unions, ignoring physical offsets, vtable
+// layout and vtable sharing. Scalar fields that are omitted compare equal to
+// fields explicitly storing the schema default, and NaN floats compare equal
+// to each other (see CompareOptions).
+// `root` selects the logical root type of both buffers (use
+// schema.root_table() for conventionally finished buffers).
+CompareResult CompareBuffers(const reflection::Schema& schema,
+                             const reflection::Object& root,
+                             const uint8_t* buf1, size_t length1,
+                             const uint8_t* buf2, size_t length2,
+                             const CompareOptions& opts = CompareOptions());
+
+// Same as CompareBuffers, but for size-prefixed FlatBuffers.
+CompareResult CompareSizePrefixedBuffers(
+    const reflection::Schema& schema, const reflection::Object& root,
+    const uint8_t* buf1, size_t length1, const uint8_t* buf2, size_t length2,
+    const CompareOptions& opts = CompareOptions());
+
+// Logically compare two already-verified tables of the same schema object
+// type. Unlike CompareBuffers this does not run verification; the caller is
+// responsible for only passing in valid buffers (e.g. via Verify()).
+CompareResult CompareTables(const reflection::Schema& schema,
+                            const reflection::Object& object,
+                            const Table& table1, const Table& table2,
+                            bool compare_nan_equal = true);
+
 }  // namespace flatbuffers
 
 #endif  // FLATBUFFERS_REFLECTION_H_

@@ -270,6 +270,439 @@ static bool VerifyObject(flatbuffers::Verifier& v,
   return true;
 }
 
+// Recursively compares two buffers' logical values through the schema.
+class LogicalComparer {
+ public:
+  LogicalComparer(const reflection::Schema& schema, bool compare_nan_equal,
+                  uoffset_t max_depth)
+      : schema_(schema),
+        compare_nan_equal_(compare_nan_equal),
+        max_depth_(max_depth),
+        depth_(0) {}
+
+  CompareResult CompareObject(const reflection::Object& object,
+                              const Table* t1, const Table* t2) {
+    // A fresh comparison always starts with an empty location path.
+    path_.clear();
+    path_stack_.clear();
+    return CompareObjectImpl(object, t1, t2);
+  }
+  CompareResult CompareObjectImpl(const reflection::Object& object,
+                                  const Table* t1, const Table* t2) {
+    if (!t1 || !t2) return PresenceResult(t1 != nullptr, t2 != nullptr);
+    if (depth_ >= max_depth_)
+      return Fail("exceeded max comparison depth (" +
+                  NumToString(max_depth_) + ")");
+    ++depth_;
+    CompareResult result;
+    for (uoffset_t i = 0; i < object.fields()->size(); i++) {
+      auto field = object.fields()->Get(i);
+      if (field->deprecated()) continue;
+      auto mark = path_stack_.size();
+      PushPath(field->name()->str());
+      result = CompareTableField(object, *field, *t1, *t2);
+      Rewind(mark);
+      if (!result.equal) {
+        --depth_;
+        return result;
+      }
+    }
+    --depth_;
+    return CompareResult();
+  }
+
+  CompareResult CompareStructObject(const reflection::Object& object,
+                                    const Struct* s1, const Struct* s2) {
+    CompareResult result;
+    for (uoffset_t i = 0; i < object.fields()->size(); i++) {
+      auto field = object.fields()->Get(i);
+      auto mark = path_stack_.size();
+      PushPath(field->name()->str());
+      result = CompareStructField(*field, s1, s2);
+      Rewind(mark);
+      if (!result.equal) return result;
+    }
+    return CompareResult();
+  }
+
+ private:
+  struct PathEntry {
+    size_t length;  // Path length right after this entry was appended.
+  };
+
+  void PushPath(const std::string& name) {
+    path_.append(path_.empty() ? name : "." + name);
+    path_stack_.push_back({path_.size()});
+  }
+  void PushIndex(size_t i) {
+    path_.append("[" + NumToString(i) + "]");
+    path_stack_.push_back({path_.size()});
+  }
+  // Remove all entries pushed after stack position `mark`.
+  void Rewind(size_t mark) {
+    // The new top entry records where its own text ends; everything past
+    // that point belongs to the entries being removed.
+    const size_t keep =
+        mark == 0 ? 0 : path_stack_[mark - 1].length;
+    path_.erase(keep);
+    path_stack_.resize(mark);
+  }
+
+  CompareResult Fail(std::string message) const {
+    return CompareResult(false, std::move(message), path_);
+  }
+
+  CompareResult PresenceResult(bool p1, bool p2) const {
+    if (p1 == p2) return CompareResult();
+    return Fail(std::string("present != absent"));
+  }
+
+  // Render a scalar value for error messages.
+  static std::string ScalarToString(reflection::BaseType type,
+                                    const uint8_t* data) {
+    if (IsFloat(type)) return NumToString(GetAnyValueF(type, data));
+    return NumToString(GetAnyValueI(type, data));
+  }
+
+  bool ScalarsEqual(reflection::BaseType type, const uint8_t* d1,
+                    const uint8_t* d2) const {
+    const auto size = GetTypeSize(type);
+    if (IsFloat(type) && compare_nan_equal_) {
+      if (type == reflection::Float) {
+        auto a = ReadScalar<float>(d1);
+        auto b = ReadScalar<float>(d2);
+        // NaN payloads differ between buffers, but logically both are NaN.
+        if (a != a && b != b) return true;
+        return a == b;
+      }
+      if (type == reflection::Double) {
+        auto a = ReadScalar<double>(d1);
+        auto b = ReadScalar<double>(d2);
+        if (a != a && b != b) return true;
+        return a == b;
+      }
+    }
+    return memcmp(d1, d2, size) == 0;
+  }
+
+  // Returns a pointer to the scalar storage of a table field, or to a local
+  // holding the schema default when the field is absent.
+  const uint8_t* EffectiveScalar(const Table& table,
+                                 const reflection::Field& field,
+                                 uint64_t* default_storage) const {
+    auto p = table.GetAddressOf(field.offset());
+    if (p) return p;
+    if (IsFloat(field.type()->base_type())) {
+      auto d = static_cast<double>(field.default_real());
+      if (field.type()->base_type() == reflection::Float) {
+        WriteScalar(reinterpret_cast<uint8_t*>(default_storage),
+                    static_cast<float>(d));
+      } else {
+        WriteScalar(reinterpret_cast<uint8_t*>(default_storage), d);
+      }
+    } else {
+      WriteScalar(reinterpret_cast<uint8_t*>(default_storage),
+                  static_cast<int64_t>(field.default_integer()));
+    }
+    return reinterpret_cast<const uint8_t*>(default_storage);
+  }
+
+  // Find the sibling `<unionfield>_type` field that stores a union's type.
+  const reflection::Field* UnionTypeField(const reflection::Object& parent,
+                                          const reflection::Field& field) {
+    return parent.fields()->LookupByKey(
+        (field.name()->str() + UnionTypeFieldSuffix()).c_str());
+  }
+
+  // Get a pointer-sized (offset based) vector element, or nullptr when the
+  // stored offset is 0 (null table/string/union element).
+  static const uint8_t* VectorElemPointer(const VectorOfAny* vec, size_t i) {
+    auto loc = vec->Data() + sizeof(uoffset_t) * i;
+    auto off = ReadScalar<uoffset_t>(loc);
+    return off ? loc + off : nullptr;
+  }
+
+  CompareResult CompareScalarsAt(reflection::BaseType type,
+                                 const uint8_t* d1, const uint8_t* d2) {
+    if (ScalarsEqual(type, d1, d2)) return CompareResult();
+    return Fail(ScalarToString(type, d1) + " != " + ScalarToString(type, d2));
+  }
+
+  CompareResult CompareStrings(const String* s1, const String* s2) {
+    if (!s1 || !s2) return PresenceResult(s1 != nullptr, s2 != nullptr);
+    if (s1->size() == s2->size() &&
+        memcmp(s1->c_str(), s2->c_str(), s1->size()) == 0)
+      return CompareResult();
+    return Fail("\"" + s1->str() + "\" != \"" + s2->str() + "\"");
+  }
+
+  CompareResult CompareTableField(const reflection::Object& parent,
+                                  const reflection::Field& field,
+                                  const Table& t1, const Table& t2) {
+    const auto type = field.type()->base_type();
+    const bool p1 = t1.CheckField(field.offset());
+    const bool p2 = t2.CheckField(field.offset());
+    switch (type) {
+      case reflection::String: {
+        if (p1 != p2) return PresenceResult(p1, p2);
+        if (!p1) return CompareResult();
+        return CompareStrings(GetFieldS(t1, field), GetFieldS(t2, field));
+      }
+      case reflection::Obj: {
+        const auto child = schema_.objects()->Get(field.type()->index());
+        if (child->is_struct()) {
+          // Structs are inline; an absent field reads as all-zero, but two
+          // valid buffers either both store them or both omit them.
+          if (p1 != p2) return PresenceResult(p1, p2);
+          if (!p1) return CompareResult();
+          const Struct* s1 = GetFieldStruct(t1, field);
+          const Struct* s2 = GetFieldStruct(t2, field);
+          return CompareStructObject(*child, s1, s2);
+        }
+        if (p1 != p2) return PresenceResult(p1, p2);
+        if (!p1) return CompareResult();
+        return CompareObjectImpl(*child, GetFieldT(t1, field),
+                                 GetFieldT(t2, field));
+      }
+      case reflection::Vector: {
+        if (p1 != p2) return PresenceResult(p1, p2);
+        if (!p1) return CompareResult();
+        const Vector<uint8_t>* tv1 = nullptr;
+        const Vector<uint8_t>* tv2 = nullptr;
+        if (field.type()->element() == reflection::Union) {
+          // The parallel type vector is stored in the previous field.
+          auto type_field = UnionTypeField(parent, field);
+          if (!type_field) return Fail("missing union type field in schema");
+          tv1 = p1 ? t1.GetPointer<const Vector<uint8_t>*>(
+                         type_field->offset())
+                   : nullptr;
+          tv2 = p2 ? t2.GetPointer<const Vector<uint8_t>*>(
+                         type_field->offset())
+                   : nullptr;
+        }
+        return CompareVectors(field, GetFieldAnyV(t1, field),
+                              GetFieldAnyV(t2, field), tv1, tv2);
+      }
+      case reflection::Union: {
+        // Compare the type first; the value is only meaningful together with
+        // it. The type field sits next to the union value field.
+        auto type_field = UnionTypeField(parent, field);
+        if (!type_field) return Fail("missing union type field in schema");
+        uint64_t store1 = 0, store2 = 0;
+        auto ut1 = EffectiveScalar(t1, *type_field, &store1);
+        auto ut2 = EffectiveScalar(t2, *type_field, &store2);
+        auto u1 = ReadScalar<uint8_t>(ut1);
+        auto u2 = ReadScalar<uint8_t>(ut2);
+        if (u1 != u2) {
+          return Fail("union type " + NumToString(u1) + " != " +
+                      NumToString(u2));
+        }
+        if (u1 == 0) {
+          // Both are NONE: the value offsets must both be absent.
+          return PresenceResult(p1, p2);
+        }
+        if (p1 != p2) return PresenceResult(p1, p2);
+        return CompareUnionElement(field, u1,
+                                   reinterpret_cast<const uint8_t*>(
+                                       GetFieldT(t1, field)),
+                                   reinterpret_cast<const uint8_t*>(
+                                       GetFieldT(t2, field)));
+      }
+      default:  // Scalar fields.
+      {
+        uint64_t store1 = 0, store2 = 0;
+        // Omitted fields compare equal to explicitly stored default values.
+        auto d1 = EffectiveScalar(t1, field, &store1);
+        auto d2 = EffectiveScalar(t2, field, &store2);
+        return CompareScalarsAt(type, d1, d2);
+      }
+    }
+  }
+
+  CompareResult CompareStructField(const reflection::Field& field,
+                                   const Struct* s1, const Struct* s2) {
+    const auto type = field.type()->base_type();
+    switch (type) {
+      case reflection::Obj: {
+        const auto child = schema_.objects()->Get(field.type()->index());
+        return CompareStructObject(
+            *child, GetFieldStruct(*s1, field), GetFieldStruct(*s2, field));
+      }
+      case reflection::Array: {
+        // Fixed-length array inside a struct.
+        const auto elem_type = field.type()->element();
+        const auto length = field.type()->fixed_length();
+        return CompareInlineArray(elem_type, field.type()->index(), length,
+                                  s1->GetAddressOf(field.offset()),
+                                  s2->GetAddressOf(field.offset()));
+      }
+      default:
+        return CompareScalarsAt(type, s1->GetAddressOf(field.offset()),
+                                s2->GetAddressOf(field.offset()));
+    }
+  }
+
+  // Compare an inline array (only occurs inside structs).
+  CompareResult CompareInlineArray(reflection::BaseType elem_type,
+                                   int type_index, uoffset_t length,
+                                   const uint8_t* d1, const uint8_t* d2) {
+    CompareResult result;
+    if (elem_type == reflection::Obj) {
+      const auto child = schema_.objects()->Get(type_index);
+      const auto elem_size = static_cast<size_t>(child->bytesize());
+      for (uoffset_t i = 0; i < length; i++) {
+        auto mark = path_stack_.size();
+        PushIndex(i);
+        result = CompareStructObject(
+            *child, reinterpret_cast<const Struct*>(d1 + i * elem_size),
+            reinterpret_cast<const Struct*>(d2 + i * elem_size));
+        Rewind(mark);
+        if (!result.equal) return result;
+      }
+      return CompareResult();
+    }
+    const auto elem_size = GetTypeSize(elem_type);
+    for (uoffset_t i = 0; i < length; i++) {
+      auto mark = path_stack_.size();
+      PushIndex(i);
+      result =
+          CompareScalarsAt(elem_type, d1 + i * elem_size, d2 + i * elem_size);
+      Rewind(mark);
+      if (!result.equal) return result;
+    }
+    return CompareResult();
+  }
+
+  CompareResult CompareUnionElement(const reflection::Field& field,
+                                    uint8_t utype, const uint8_t* v1,
+                                    const uint8_t* v2) {
+    auto enumdef = schema_.enums()->Get(field.type()->index());
+    auto member_type = enumdef->values()->Get(utype)->union_type();
+    switch (member_type->base_type()) {
+      case reflection::String:
+        return CompareStrings(reinterpret_cast<const String*>(v1),
+                              reinterpret_cast<const String*>(v2));
+      case reflection::Obj: {
+        auto child = schema_.objects()->Get(member_type->index());
+        if (child->is_struct()) {
+          return CompareStructObject(
+              *child, reinterpret_cast<const Struct*>(v1),
+              reinterpret_cast<const Struct*>(v2));
+        }
+        return CompareObjectImpl(
+            *child, reinterpret_cast<const Table*>(v1),
+            reinterpret_cast<const Table*>(v2));
+      }
+      default:
+        return Fail("unsupported union member type");
+    }
+  }
+
+  // Compare two vectors. For vectors of unions, `type_vec` points to the
+  // parallel type vector belonging to the enclosing table field.
+  CompareResult CompareVectors(const reflection::Field& field,
+                               const VectorOfAny* v1, const VectorOfAny* v2,
+                               const Vector<uint8_t>* type_vec1,
+                               const Vector<uint8_t>* type_vec2) {
+    if (v1->size() != v2->size()) {
+      return Fail("vector length " + NumToString(v1->size()) + " != " +
+                  NumToString(v2->size()));
+    }
+    const auto elem_type = field.type()->element();
+    switch (elem_type) {
+      case reflection::String: {
+        for (uoffset_t i = 0; i < v1->size(); i++) {
+          auto mark = path_stack_.size();
+          PushIndex(i);
+          auto s1 = reinterpret_cast<const String*>(VectorElemPointer(v1, i));
+          auto s2 = reinterpret_cast<const String*>(VectorElemPointer(v2, i));
+          auto result = CompareStrings(s1, s2);
+          Rewind(mark);
+          if (!result.equal) return result;
+        }
+        break;
+      }
+      case reflection::Obj: {
+        const auto child = schema_.objects()->Get(field.type()->index());
+        if (child->is_struct()) {
+          for (uoffset_t i = 0; i < v1->size(); i++) {
+            auto mark = path_stack_.size();
+            PushIndex(i);
+            auto s1 = GetAnyVectorElemAddressOf<const Struct>(
+                v1, i, static_cast<size_t>(child->bytesize()));
+            auto s2 = GetAnyVectorElemAddressOf<const Struct>(
+                v2, i, static_cast<size_t>(child->bytesize()));
+            auto result = CompareStructObject(*child, s1, s2);
+            Rewind(mark);
+            if (!result.equal) return result;
+          }
+        } else {
+          for (uoffset_t i = 0; i < v1->size(); i++) {
+            auto mark = path_stack_.size();
+            PushIndex(i);
+            auto t1 =
+                reinterpret_cast<const Table*>(VectorElemPointer(v1, i));
+            auto t2 =
+                reinterpret_cast<const Table*>(VectorElemPointer(v2, i));
+            auto result = CompareObjectImpl(*child, t1, t2);
+            Rewind(mark);
+            if (!result.equal) return result;
+          }
+        }
+        break;
+      }
+      case reflection::Union: {
+        if ((type_vec1 == nullptr) != (type_vec2 == nullptr))
+          return Fail("missing union type vector");
+        for (uoffset_t i = 0; i < v1->size(); i++) {
+          auto mark = path_stack_.size();
+          PushIndex(i);
+          auto u1 = type_vec1 ? type_vec1->Get(i) : 0;
+          auto u2 = type_vec2 ? type_vec2->Get(i) : 0;
+          if (u1 != u2) {
+            Rewind(mark);
+            return Fail("union type " + NumToString(u1) + " != " +
+                        NumToString(u2));
+          }
+          if (u1 != 0) {
+            auto e1 = VectorElemPointer(v1, i);
+            auto e2 = VectorElemPointer(v2, i);
+            if (!e1 || !e2) {
+              Rewind(mark);
+              return PresenceResult(e1 != nullptr, e2 != nullptr);
+            }
+            auto result = CompareUnionElement(field, u1, e1, e2);
+            Rewind(mark);
+            if (!result.equal) return result;
+          }
+        }
+        break;
+      }
+      default: {
+        // Scalar elements.
+        for (uoffset_t i = 0; i < v1->size(); i++) {
+          auto mark = path_stack_.size();
+          PushIndex(i);
+          auto result = CompareScalarsAt(
+              elem_type, v1->Data() + GetTypeSize(elem_type) * i,
+              v2->Data() + GetTypeSize(elem_type) * i);
+          Rewind(mark);
+          if (!result.equal) return result;
+        }
+        break;
+      }
+    }
+    return CompareResult();
+  }
+
+  const reflection::Schema& schema_;
+  bool compare_nan_equal_;
+  uoffset_t max_depth_;
+  uoffset_t depth_;
+  std::string path_;
+  std::vector<PathEntry> path_stack_;
+};
+
 }  // namespace
 
 int64_t GetAnyValueI(reflection::BaseType type, const uint8_t* data) {
@@ -798,6 +1231,67 @@ bool VerifySizePrefixed(const reflection::Schema& schema,
   Verifier v(buf, length, max_depth, max_tables);
   return VerifyObject(v, schema, root, flatbuffers::GetAnySizePrefixedRoot(buf),
                       /*required=*/true);
+}
+
+namespace {
+
+CompareResult DoCompare(const reflection::Schema& schema,
+                        const reflection::Object& root, const uint8_t* buf1,
+                        size_t length1, const uint8_t* buf2, size_t length2,
+                        bool size_prefixed, const CompareOptions& opts) {
+  const bool ok1 = size_prefixed
+                       ? VerifySizePrefixed(schema, root, buf1, length1,
+                                            opts.max_depth, opts.max_tables)
+                       : Verify(schema, root, buf1, length1, opts.max_depth,
+                                opts.max_tables);
+  const bool ok2 = size_prefixed
+                       ? VerifySizePrefixed(schema, root, buf2, length2,
+                                            opts.max_depth, opts.max_tables)
+                       : Verify(schema, root, buf2, length2, opts.max_depth,
+                                opts.max_tables);
+  if (!ok1 || !ok2) {
+    if (opts.equal_invalid_buffers && !ok1 && !ok2) return CompareResult();
+    return CompareResult(
+        false,
+        std::string("verification failed (") +
+            (!ok1 && !ok2 ? "both buffers" : !ok1 ? "first buffer"
+                                                 : "second buffer") +
+            ")",
+        "");
+  }
+  const Table* t1 = size_prefixed ? GetAnySizePrefixedRoot(buf1)
+                                  : GetAnyRoot(buf1);
+  const Table* t2 = size_prefixed ? GetAnySizePrefixedRoot(buf2)
+                                  : GetAnyRoot(buf2);
+  LogicalComparer comparer(schema, opts.compare_nan_equal, opts.max_depth);
+  return comparer.CompareObject(root, t1, t2);
+}
+
+}  // namespace
+
+CompareResult CompareBuffers(const reflection::Schema& schema,
+                             const reflection::Object& root,
+                             const uint8_t* buf1, size_t length1,
+                             const uint8_t* buf2, size_t length2,
+                             const CompareOptions& opts) {
+  return DoCompare(schema, root, buf1, length1, buf2, length2,
+                   /*size_prefixed=*/false, opts);
+}
+
+CompareResult CompareSizePrefixedBuffers(
+    const reflection::Schema& schema, const reflection::Object& root,
+    const uint8_t* buf1, size_t length1, const uint8_t* buf2, size_t length2,
+    const CompareOptions& opts) {
+  return DoCompare(schema, root, buf1, length1, buf2, length2,
+                   /*size_prefixed=*/true, opts);
+}
+
+CompareResult CompareTables(const reflection::Schema& schema,
+                            const reflection::Object& object,
+                            const Table& table1, const Table& table2,
+                            bool compare_nan_equal) {
+  LogicalComparer comparer(schema, compare_nan_equal, 64);
+  return comparer.CompareObject(object, &table1, &table2);
 }
 
 }  // namespace flatbuffers

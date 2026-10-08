@@ -1,0 +1,40 @@
+// Schema used by reflection_compare_test.cpp for the reflection-based
+// logical buffer comparison API.
+
+namespace cmp;
+
+struct Point {
+  x:float;
+  y:float;
+}
+
+// FlatBuffers has no nested vectors, so a nested [[int]] is expressed as
+// a vector of wrapper tables.
+table VectorWrapper {
+  values:[int];
+}
+
+table Inner {
+  // Default is 7, so "omitted" and "explicit 7" must compare equal.
+  n:int = 7;
+  label:string;
+  matrix:[VectorWrapper];
+}
+
+union Any { Inner, S: string }
+
+table Root {
+  id:int = 42;
+  ratio:float = 1.5;
+  // NaN by default: omitted and explicit NaN must compare equal.
+  weird:float = nan;
+  name:string;
+  pos:Point;
+  tags:[string];
+  numbers:[long];
+  inners:[Inner];
+  any:Any;
+  anys:[Any];
+}
+
+root_type Root;

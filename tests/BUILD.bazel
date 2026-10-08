@@ -67,6 +67,9 @@ cc_test(
         "proto_test.h",
         "reflection_test.cpp",
         "reflection_test.h",
+        "reflection_compare_test.cpp",
+        "reflection_compare_test.h",
+        "reflection_compare_test_generated.h",
         "test.cpp",
         "test_assert.cpp",
         "test_assert.h",
@@ -142,6 +145,7 @@ cc_test(
         ":monster_extra_cc_fbs",
         ":monster_test_cc_fbs",
         ":native_type_test_cc_fbs",
+        ":reflection_compare_test_cc_fbs",
         "//:flatbuffers",
         "//src:generate_fbs",
     ],
@@ -266,6 +270,17 @@ flatbuffer_cc_library(
 flatbuffer_cc_library(
     name = "cross_namespace_pack_test_cc_fbs",
     srcs = ["cross_namespace_pack_test.fbs"],
+    flatc_args = [
+        "--gen-object-api",
+        "--gen-mutable",
+        "--gen-compare",
+        "--reflect-names",
+    ],
+)
+
+flatbuffer_cc_library(
+    name = "reflection_compare_test_cc_fbs",
+    srcs = ["reflection_compare_test.fbs"],
     flatc_args = [
         "--gen-object-api",
         "--gen-mutable",

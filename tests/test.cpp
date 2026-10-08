@@ -53,6 +53,7 @@
 #include "parser_test.h"
 #include "proto_test.h"
 #include "reflection_test.h"
+#include "reflection_compare_test.h"
 #include "tests/union_vector/union_vector_generated.h"
 #include "union_underlying_type_test_generated.h"
 #if !defined(_MSC_VER) || _MSC_VER >= 1700
@@ -1774,6 +1775,7 @@ int FlatBufferTests(const std::string& tests_data_path) {
   FixedLengthArrayJsonTest(tests_data_path, false);
   FixedLengthArrayJsonTest(tests_data_path, true);
   ReflectionTest(tests_data_path, flatbuf.data(), flatbuf.size());
+  ReflectionCompareTest();
   ForAllFieldsReverseTest(tests_data_path);
   ParseProtoTest(tests_data_path);
   EvolutionTest(tests_data_path);
