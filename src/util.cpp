@@ -60,7 +60,10 @@ namespace {
 
 static bool FileExistsRaw(const char* name) {
   std::ifstream ifs(name);
-  return ifs.good();
+  // Use is_open() rather than good(): some standard library implementations
+  // do not set failbit on the stream when the file cannot be opened, which
+  // makes good() return true for non-existent files.
+  return ifs.is_open();
 }
 
 static bool LoadFileRaw(const char* name, bool binary, std::string* buf) {
